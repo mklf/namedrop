@@ -185,6 +185,18 @@ impl Fixture {
         let guidance = hook["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();
+        assert!(!guidance.contains("Return requested findings through the bound reply"));
+        assert!(!guidance.contains("do not recruit peers independently"));
+        let inbox =
+            execute_integration_operation("delivery.inbox", json!({}), &self.runtime("lead"))
+                .unwrap();
+        assert!(
+            !inbox["worker_attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|attempt| attempt.as_str() == envelope["control"]["attempt_id"].as_str())
+        );
         let echo = self.home.join("echo-argv");
         fs::write(&echo, "#!/bin/sh\nprintf '%s\n' \"$@\"\n").unwrap();
         fs::set_permissions(&echo, fs::Permissions::from_mode(0o700)).unwrap();
@@ -710,7 +722,12 @@ fn coordinator_callback_adds_two_workers_with_separate_checkout_context() {
             .unwrap();
         assert!(worker_ops.iter().all(|op| !matches!(
             op["token"].as_str().unwrap(),
-            "send" | "handoff.resolve" | "handoff.preview" | "address.list"
+            "send"
+                | "handoff.resolve"
+                | "handoff.preview"
+                | "address.list"
+                | "address.resolve"
+                | "address.candidates"
         )));
         let mut read_snapshot = false;
         let mut read_diff = false;
@@ -2129,6 +2146,23 @@ fn a_stale_wake_is_rendered_stale_in_flight_and_settles_as_no_reply_after_the_gr
         .expect("stale wake in flight");
     assert_eq!(stale["control"]["coordination_id"], id);
     assert_eq!(stale["control"]["coordination_nudge_stale"], true);
+    assert!(
+        !inbox["worker_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| attempt.as_str() == Some(old_attempt.as_str()))
+    );
+    let stale_hook = execute_user_prompt_submit_hook(
+        &json!({"hook_event_name":"UserPromptSubmit", "prompt":stale.to_string()}).to_string(),
+        &f.runtime("lead"),
+    )
+    .unwrap();
+    let stale_guidance = stale_hook["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(!stale_guidance.contains("Return requested findings through the bound reply"));
+    assert!(!stale_guidance.contains("do not recruit peers independently"));
     let stale_operations = stale["control"]["tool"]["operations"].as_array().unwrap();
     assert!(
         stale_operations
@@ -2137,7 +2171,14 @@ fn a_stale_wake_is_rendered_stale_in_flight_and_settles_as_no_reply_after_the_gr
     );
     assert!(stale_operations.iter().all(|op| !matches!(
         op["token"].as_str(),
-        Some("send" | "handoff.resolve" | "address.list" | "handoff.preview")
+        Some(
+            "send"
+                | "handoff.resolve"
+                | "address.list"
+                | "address.resolve"
+                | "address.candidates"
+                | "handoff.preview"
+        )
     )));
     assert!(
         stale["control"]["permitted_operations"]
@@ -2146,7 +2187,14 @@ fn a_stale_wake_is_rendered_stale_in_flight_and_settles_as_no_reply_after_the_gr
             .iter()
             .all(|op| !matches!(
                 op.as_str(),
-                Some("send" | "handoff.resolve" | "address.list" | "handoff.preview")
+                Some(
+                    "send"
+                        | "handoff.resolve"
+                        | "address.list"
+                        | "address.resolve"
+                        | "address.candidates"
+                        | "handoff.preview"
+                )
             ))
     );
     assert!(

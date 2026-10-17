@@ -36,86 +36,167 @@ impl StateTransaction<'_> {
             .transpose()
     }
 
+    pub(crate) fn recipient_readiness(
+        &self,
+        namespace: &StateNamespace,
+        discovered: &crate::DiscoveredWorktree,
+        address_id: &PaneAddressId,
+        delivery_id: Option<&str>,
+        shell_availability: &std::collections::BTreeMap<String, bool>,
+    ) -> Result<crate::availability::RecipientReadiness, StoreError> {
+        let address = self
+            .list_pane_addresses(namespace)?
+            .into_iter()
+            .find(|address| &address.id == address_id);
+        let shell_available = address
+            .as_ref()
+            .and_then(|address| address.pane_id.as_ref())
+            .and_then(|pane_id| shell_availability.get(pane_id).copied());
+        self.readiness_for_address(
+            namespace,
+            discovered,
+            address.as_ref(),
+            delivery_id,
+            shell_available,
+        )
+    }
+
+    fn readiness_for_address(
+        &self,
+        namespace: &StateNamespace,
+        discovered: &crate::DiscoveredWorktree,
+        address: Option<&PaneAddressRecord>,
+        delivery_id: Option<&str>,
+        shell_available: Option<bool>,
+    ) -> Result<crate::availability::RecipientReadiness, StoreError> {
+        let Some(address) = address else {
+            return Ok(crate::availability::project(
+                crate::availability::RecipientReadinessFacts {
+                    address: None,
+                    live: None,
+                    worktree_state: None,
+                    reconciliation_completed: false,
+                    registration_required: false,
+                    integration_repair_required: false,
+                    shell_available: None,
+                    earlier_deliveries: 0,
+                    held_deliveries: 0,
+                },
+            ));
+        };
+        let live = address
+            .pane_id
+            .as_ref()
+            .and_then(|id| discovered.panes.iter().find(|pane| &pane.pane_id == id));
+        let mut registration_required = false;
+        let mut integration_repair_required = false;
+        if address.pane_type != crate::PaneType::Terminal
+            && let Some(session) = live.and_then(|pane| pane.agent_session_id.as_ref())
+            && address.agent_session_id.as_ref() == Some(session)
+        {
+            match self.active_integration_registration(namespace, &address.id, session)? {
+                None => registration_required = true,
+                Some(registration)
+                    if self.integration_package_failed(namespace, registration.runtime)? =>
+                {
+                    integration_repair_required = true;
+                }
+                Some(_) => {}
+            }
+        }
+        let (earlier_deliveries, held_deliveries): (u64, u64) = self.transaction.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN state='held' THEN 1 ELSE 0 END),0)
+             FROM mailbox_deliveries WHERE session_socket_id=?1 AND worktree_id=?2 AND address_id=?3
+             AND state NOT IN ('settled','failed','cancelled') AND (?4 IS NULL OR mailbox_order < (
+                SELECT mailbox_order FROM mailbox_deliveries WHERE session_socket_id=?1 AND worktree_id=?2 AND delivery_id=?4))",
+            params![namespace.session_socket_id,namespace.space_id.as_str(),address.id.as_str(),delivery_id],
+            |row| Ok((from_i64(row.get(0)?)?, from_i64(row.get(1)?)?)),
+        )?;
+        Ok(crate::availability::project(
+            crate::availability::RecipientReadinessFacts {
+                address: Some(address),
+                live,
+                worktree_state: self.worktree_state(namespace)?,
+                reconciliation_completed: self.reconciliation_completed(namespace)?,
+                registration_required,
+                integration_repair_required,
+                shell_available,
+                earlier_deliveries,
+                held_deliveries,
+            },
+        ))
+    }
+
     pub(crate) fn recipient_preview(
         &self,
         namespace: &StateNamespace,
         discovered: &crate::DiscoveredWorktree,
         address_id: &PaneAddressId,
         delivery_id: Option<&str>,
+        shell_availability: &std::collections::BTreeMap<String, bool>,
     ) -> Result<Value, StoreError> {
         let address = self
             .list_pane_addresses(namespace)?
             .into_iter()
-            .find(|a| &a.id == address_id);
+            .find(|address| &address.id == address_id);
         let Some(address) = address else {
             return Ok(json!({"address_id":address_id,"constraints":["recipient_removed"]}));
         };
         let live = address
             .pane_id
             .as_ref()
-            .and_then(|id| discovered.panes.iter().find(|p| &p.pane_id == id));
-        let mut constraints = Vec::new();
-        match self.worktree_state(namespace)? {
-            Some(s) if s.activated && !s.deactivated => {
-                if s.paused {
-                    constraints.push("space_paused");
-                }
-            }
-            _ => constraints.push("space_inactive"),
-        }
-        if !self.reconciliation_completed(namespace)? {
-            constraints.push("reconciliation_required");
-        }
-        if address.collaboration_disabled {
-            constraints.push("recipient_disabled");
-        }
-        if address.pane_id.is_none() {
-            constraints.push("recipient_unbound");
-        }
-        if address.pane_type == crate::PaneType::Terminal {
-            if live.is_none() {
-                constraints.push("recipient_disconnected");
-            } else if live.is_some_and(|p| p.agent.is_some() || p.agent_session_id.is_some()) {
-                constraints.push("terminal_contains_agent");
-            }
-        } else {
-            match live.and_then(|p| p.agent_session_id.as_ref()) {
-                None => constraints.push("recipient_disconnected"),
-                Some(session) if address.agent_session_id.as_ref() != Some(session) => {
-                    constraints.push("session_changed")
-                }
-                Some(session) => {
-                    match self.active_integration_registration(namespace, address_id, session)? {
-                        None => constraints.push("registration_required"),
-                        Some(r) if self.integration_package_failed(namespace, r.runtime)? => {
-                            constraints.push("integration_repair_required")
-                        }
-                        Some(_) => (),
-                    }
-                    if !matches!(
-                        live.and_then(|p| p.agent_status.as_deref()),
-                        Some("idle" | "done")
-                    ) {
-                        constraints.push("recipient_busy_or_unknown");
-                    }
-                }
-            }
-        }
-        let ahead: u64 = self.transaction.query_row(
-            "SELECT COUNT(*) FROM mailbox_deliveries WHERE session_socket_id=?1 AND worktree_id=?2 AND address_id=?3
-             AND state NOT IN ('settled','failed','cancelled') AND (?4 IS NULL OR mailbox_order < (
-                SELECT mailbox_order FROM mailbox_deliveries WHERE session_socket_id=?1 AND worktree_id=?2 AND delivery_id=?4))",
-            params![namespace.session_socket_id,namespace.space_id.as_str(),address_id.as_str(),delivery_id],|r|from_i64(r.get(0)?))?;
-        if ahead > 0 {
-            constraints.push("earlier_delivery_pending");
-        }
+            .and_then(|id| discovered.panes.iter().find(|pane| &pane.pane_id == id));
+        let shell_available = address
+            .pane_id
+            .as_ref()
+            .and_then(|pane_id| shell_availability.get(pane_id).copied());
+        let readiness = self.readiness_for_address(
+            namespace,
+            discovered,
+            Some(&address),
+            delivery_id,
+            shell_available,
+        )?;
+        let delivery_expectation = readiness.delivery_expectation(address.pane_type);
         Ok(
             json!({"address_id":address_id,"alias":address.alias,"pane_id":address.pane_id,
             "pane_type":address.pane_type,
-            "agent_session_id":live.and_then(|p|p.agent_session_id.as_ref()),"agent_status":live.and_then(|p|p.agent_status.as_ref()),
-            "constraints":constraints,"earlier_deliveries":ahead,
-            "delivery_expectation":if !constraints.is_empty(){"queued until constraints clear"}else if address.pane_type==crate::PaneType::Terminal {"command executes after dispatch verifies an available shell"}else{"eligible after dispatch revalidates a settled session"}}),
+            "agent_session_id":live.and_then(|pane|pane.agent_session_id.as_ref()),"agent_status":live.and_then(|pane|pane.agent_status.as_ref()),
+            "constraints":readiness.constraints,"earlier_deliveries":readiness.earlier_deliveries,
+            "delivery_expectation":delivery_expectation}),
         )
+    }
+
+    pub(crate) fn alias_resolution_metadata(
+        &self,
+        namespace: &StateNamespace,
+        alias: &str,
+    ) -> Result<Option<(PaneAddressId, bool, Option<String>)>, StoreError> {
+        self.transaction
+            .query_row(
+                "SELECT c.address_id, c.claim_state, c.replacement_alias, a.retired
+                 FROM alias_claims c
+                 JOIN pane_addresses a
+                   ON a.session_socket_id = c.session_socket_id
+                  AND a.worktree_id = c.worktree_id
+                  AND a.address_id = c.address_id
+                 WHERE c.session_socket_id = ?1 AND c.worktree_id = ?2 AND c.alias = ?3",
+                params![
+                    namespace.session_socket_id,
+                    namespace.space_id.as_str(),
+                    alias
+                ],
+                |row| {
+                    let claim_state = row.get::<_, String>(1)?;
+                    Ok((
+                        PaneAddressId::new(row.get::<_, String>(0)?),
+                        claim_state == "tombstone" || row.get::<_, bool>(3)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     pub(crate) fn add_handoff_outlooks(
@@ -123,18 +204,23 @@ impl StateTransaction<'_> {
         namespace: &StateNamespace,
         discovered: &crate::DiscoveredWorktree,
         report: &mut Value,
+        shell_availability: &std::collections::BTreeMap<String, bool>,
     ) -> Result<(), StoreError> {
         let thread = self.thread_control_state(
             namespace,
             &ThreadId::new(report["thread_id"].as_str().unwrap()),
         )?;
         for recipient in report["recipients"].as_array_mut().unwrap() {
-            if recipient["state"] == "queued" {
+            if matches!(
+                recipient["state"].as_str(),
+                Some("queued" | "terminal_waiting")
+            ) {
                 let mut outlook = self.recipient_preview(
                     namespace,
                     discovered,
                     &PaneAddressId::new(recipient["target"]["address_id"].as_str().unwrap()),
                     recipient["delivery_id"].as_str(),
+                    shell_availability,
                 )?;
                 if thread.paused {
                     outlook["constraints"]

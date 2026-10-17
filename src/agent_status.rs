@@ -375,6 +375,7 @@ where
                     notes.push(format!("Namedrop names could not be read: {error}"));
                     Vec::new()
                 });
+            let shell_availability = crate::terminal::shell_availability(runtime.herdr, &addresses);
             let reports = store.transaction(|transaction| {
                 let author = crate::context::registered_current_address(
                     transaction,
@@ -403,7 +404,12 @@ where
                     }
                     let mut report =
                         transaction.handoff_report(&namespace, &author, id, now, false)?;
-                    transaction.add_handoff_outlooks(&namespace, discovered, &mut report)?;
+                    transaction.add_handoff_outlooks(
+                        &namespace,
+                        discovered,
+                        &mut report,
+                        &shell_availability,
+                    )?;
                     reports.push(report);
                 }
                 Ok((reports, incomplete))
@@ -714,12 +720,13 @@ fn panes(count: usize) -> String {
     format!("{count} pane{}", if count == 1 { "" } else { "s" })
 }
 
-/// Codex and Claude Code are the hosts Namedrop drives. Anything else, a shell
-/// included, has no host and gets facts without a description.
+/// Supported agents carry their host identity. Anything else, a shell included,
+/// has no host and gets facts without a description.
 fn host(pane: &DiscoveredPane) -> Option<&'static str> {
     match crate::integration::pane_agent_runtime(pane) {
         Some(AgentRuntime::Codex) => Some("codex"),
         Some(AgentRuntime::ClaudeCode) => Some("claude"),
+        Some(AgentRuntime::KimiCode) => Some("kimi"),
         None => None,
     }
 }

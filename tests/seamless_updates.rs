@@ -96,6 +96,7 @@ fn linux_preflight_requires_landlock_and_named_prerequisites() {
         ("git", "git version 2.51.0"),
         ("codex", "codex-cli 0.156.1"),
         ("claude", "2.1.282 (Claude Code)"),
+        ("kimi", "2.2.0"),
     ] {
         stub(name, &format!("echo '{version}'"));
     }
@@ -117,6 +118,7 @@ fn linux_preflight_requires_landlock_and_named_prerequisites() {
             .env("HOME", &root)
             .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
             .env("CODEX_HOME", root.join(".codex"))
+            .env("KIMI_CODE_HOME", root.join(".kimi-code"))
             .env("FAKE_LANDLOCK", landlock)
             .output()
             .unwrap();
@@ -158,7 +160,21 @@ fn linux_preflight_requires_landlock_and_named_prerequisites() {
     );
     fs::remove_file(bin.join("codex")).unwrap();
     let (code, out, _) = run("x86_64", "3");
+    assert_eq!(
+        code,
+        Some(0),
+        "Claude or Kimi must not require Codex: {out}"
+    );
+    fs::remove_file(bin.join("claude")).unwrap();
+    let (code, out, _) = run("x86_64", "3");
+    assert_eq!(
+        code,
+        Some(0),
+        "Kimi alone must satisfy the agent prerequisite: {out}"
+    );
+    fs::remove_file(bin.join("kimi")).unwrap();
+    let (code, out, _) = run("x86_64", "3");
     assert_eq!(code, Some(1), "{out}");
-    assert!(out.contains("missing required: codex\n"), "{out}");
+    assert!(out.contains("missing required: supported-agent\n"), "{out}");
     fs::remove_dir_all(&root).unwrap();
 }

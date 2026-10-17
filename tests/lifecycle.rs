@@ -1837,9 +1837,14 @@ fn lifecycle_operations_activate_create_bind_and_list_through_one_contract() {
         true
     );
     let rules = fs::read_to_string(directory.home().join(".codex/rules/namedrop.rules")).unwrap();
-    assert_eq!(rules.matches("prefix_rule(").count(), 18);
+    assert_eq!(rules.matches("prefix_rule(").count(), 20);
     let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-    for argv in [vec!["address", "list"], vec!["complete", "--no-reply"]] {
+    for argv in [
+        vec!["address", "list"],
+        vec!["address", "resolve"],
+        vec!["address", "candidates"],
+        vec!["complete", "--no-reply"],
+    ] {
         let mut pattern = vec![
             executable.to_string_lossy().into_owned(),
             "--plugin-state".to_owned(),
@@ -2033,7 +2038,11 @@ fn strict_inputs_and_activation_confirmation_fail_before_mutation() {
     assert!(preview.contains("settled_delay_ms:500"));
     // The confirmation discloses both shared user-level Agent Integration
     // targets, and that they are shared, before anything is written.
-    for agent_runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for agent_runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let target = package_directory(directory.home(), agent_runtime);
         assert!(
             preview.contains(&format!("{}: {}", agent_runtime.as_str(), target.display())),

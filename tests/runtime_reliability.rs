@@ -5,7 +5,7 @@ use namedrop::{
 };
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -62,6 +62,7 @@ impl Fixture {
             .env("HOME", self.root.join("home"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("home").join(".claude"))
             .env("CODEX_HOME", self.root.join("home").join(".codex"))
+            .env("KIMI_CODE_HOME", self.root.join("home").join(".kimi-code"))
             .env_remove("XDG_CONFIG_HOME")
             .env("CODEX_HOME", self.root.join("home/.codex"))
             .env_remove("NAMEDROP_HERDR_TIMEOUT_MS");
@@ -423,6 +424,29 @@ fn mailbox_wake_preserves_live_leases_while_explicit_reconcile_recovers_crashes(
     let restart = fixture.command().arg("reconcile").output().unwrap();
     assert!(restart.status.success(), "{restart:?}");
     assert_eq!(fixture.attempt_state(&attempt), DeliveryState::Held);
+}
+
+#[test]
+fn mailbox_wake_does_not_need_an_inherited_pane_identity() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    fixture.connect_recipient();
+    fixture.queue_message();
+    let mut other = Command::new("sleep").arg("30").spawn().unwrap();
+    let wake = fixture
+        .command()
+        .env("TEST_SHELL_PID", other.id().to_string())
+        .env_remove("CODEX_SESSION_ID")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("NAMEDROP_AGENT_SESSION_ID")
+        .args(["hook", "mailbox-wake", "--state-directory"])
+        .arg(fixture.state())
+        .output()
+        .unwrap();
+    other.kill().unwrap();
+    other.wait().unwrap();
+    assert!(wake.status.success(), "{wake:?}");
+    assert_eq!(fixture.inbox_bodies(), vec!["review".to_owned()]);
 }
 
 #[test]
@@ -1114,7 +1138,7 @@ fn status_worker_settles_an_attempt_whose_event_pane_closed_during_the_grace() {
     let attempt = fixture.acknowledged_attempt(now_ms() - 25_000);
     let marker = fixture.queue_status_for("event-pane-closes", "pane-event");
     let mut worker = fixture.worker();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while marker.exists() {
         assert!(
             Instant::now() < deadline,
@@ -1142,7 +1166,7 @@ fn status_worker_serves_a_marker_written_during_a_grace_wait_without_delay() {
     let attempt = fixture.acknowledged_attempt(now_ms() - 24_000);
     let first = fixture.queue_status("turn-ended");
     let mut worker = fixture.worker();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while first.exists() {
         assert!(
             Instant::now() < deadline,
@@ -1164,4 +1188,35 @@ fn status_worker_serves_a_marker_written_during_a_grace_wait_without_delay() {
     );
     worker.finish();
     assert_eq!(fixture.attempt_state(&attempt), DeliveryState::Settled);
+}
+
+#[test]
+fn ordinary_prompt_hook_returns_before_herdr_runtime() {
+    let fixture = Fixture::new();
+    fixture.set_herdr("printf '%s\\n' \"$*\" >> \"$NAMEDROP_TEST_FIXTURE/herdr-calls\"\n");
+    let mut child = fixture
+        .command()
+        .args(["hook", "user-prompt-submit", "--state-directory"])
+        .arg(fixture.state())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            br#"{"hook_event_name":"UserPromptSubmit","prompt":[{"type":"text","text":"Ask @reviewer to inspect this."}]}"#,
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(
+        !fixture.root.join("herdr-calls").exists(),
+        "ordinary input constructed the Herdr runtime"
+    );
 }

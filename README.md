@@ -6,7 +6,7 @@
 
 <h1 align="center">Namedrop</h1>
 
-<p align="center"><strong>@mentions for Codex, Claude Code, and your terminal.</strong></p>
+<p align="center"><strong>@mentions for Codex, Claude Code, Kimi Code, and your terminal.</strong></p>
 
 <p align="center">
   <a href="docs/assets/namedrop-overview.mp4"><img height="36" alt="Watch the 2½-minute narrated overview" src="https://img.shields.io/badge/%E2%96%B6%20Watch%20the%20overview-2%C2%BD%20min%20video-7de2d1?style=for-the-badge"></a>
@@ -71,7 +71,7 @@ You need:
 
 - **macOS on Apple silicon** or **Linux on x86_64** with glibc.
 - **[Herdr](https://herdr.dev) 0.7.5 or newer**.
-- **Codex or Claude Code**, and **Python 3.9 or newer** on `PATH`.
+- **Codex, Claude Code, or Kimi Code**, and **Python 3.9 or newer** on `PATH`.
 - **Git, Rust 1.97 or newer, and a C compiler and linker**, because Herdr builds Namedrop from source. On macOS, Apple's command-line developer tools provide the compiler. A [release archive](#install-from-a-release-archive) doesn't need these.
 
 On Linux, install from a local Herdr workspace. A remote workspace installs Namedrop on the remote host. With Codex on Linux, Agent status summaries and persona suggestions also need Landlock and the official static Codex executable. `namedrop doctor` tells you what's missing. Linux aarch64 builds pass CI but nobody has tested them by hand yet.
@@ -84,6 +84,7 @@ Open a terminal in the Herdr workspace where you want to use Namedrop. Check the
 herdr integration status
 herdr integration install codex
 herdr integration install claude
+herdr integration install kimi
 ```
 
 Install Namedrop and open its setup tab:
@@ -134,6 +135,7 @@ Follow the instructions that activation prints, then start **fresh agent session
 
 - **Codex.** When `codex` is on `PATH`, activation installs or refreshes the local Namedrop plugin for you. Start a new session. If Codex asks, review and trust the Namedrop entries in `/hooks`.
 - **Claude Code.** Start a new session, or run `/reload-plugins` to load the Namedrop integration.
+- **Kimi Code.** Activation installs the skill, `UserPromptSubmit` hook, and scoped permissions in `$KIMI_CODE_HOME` (default `~/.kimi-code`). Start a new session, or run `/reload`.
 
 To confirm the setup works, name two agents as shown at the top of this page. Send a short request from one to the other, check that the reply comes back, and then try the other direction. A clean install or health check alone doesn't prove that the hooks fired.
 
@@ -250,11 +252,11 @@ Changes to unrelated files don't make the review stale. The check covers the rev
 
 <p align="center"><img src="docs/assets/agent-status.png" width="100%" alt="The Agent status panel over @tester's Claude Code pane in Herdr: @tester's current work, one outstanding reply from @coder with its progress, and a summary of @build."></p>
 
-In a Codex or Claude Code pane, press **Prefix**, then **Shift-S**. The panel shows the pane's current work, its outstanding requests with what each recipient is doing, and a short overview of the other agents in the workspace. You can also run `herdr plugin action invoke agent-status --plugin namedrop`.
+In a Codex, Claude Code, or Kimi Code pane, press **Prefix**, then **Shift-S**. The panel shows the pane's current work, its outstanding requests with what each recipient is doing, and a short overview of the other agents in the workspace. You can also run `herdr plugin action invoke agent-status --plugin namedrop`.
 
 **R** refreshes, **↑** and **↓** scroll, and **Esc** closes. Agent states and outstanding requests appear at once. **Preparing summary…** placeholders fill in as descriptions arrive.
 
-Each description comes from a separate background request through the host of the pane you opened the panel from: Haiku for Claude Code, Luna for Codex. The request uses your existing sign-in and usage allowance, and it doesn't prompt or interrupt the active session. Outstanding requests come from Namedrop's delivery records. The model writes only the descriptions. If a summary fails, the panel shows the reason and the pane's recent output. See [panel behavior and limits](docs/operations.md#agent-status-panel).
+Each description comes from a separate background request through the host of the pane you opened the panel from: Haiku for Claude Code, Luna for Codex. The request uses your existing sign-in and usage allowance, and it doesn't prompt or interrupt the active session. Outstanding requests come from Namedrop's delivery records. The model writes only the descriptions. If a summary fails, the panel shows the reason and the pane's recent output. Kimi Code currently shows these facts and recent output without model-generated summaries or persona suggestions. See [panel behavior and limits](docs/operations.md#agent-status-panel).
 
 ## Tour
 
@@ -281,9 +283,9 @@ namedrop name @reviewer --generic   # clear it
 
 Personas are optional. An agent without one is **Generic**. It has no specialty, and other agents still pick it for ordinary work. Naming an agent again keeps its saved persona. Only `--generic`, the persona editor, or an explicit request changes it.
 
-At the start of each turn, and with each incoming request, every agent receives the workspace roster. The roster lists each named agent, its persona, and whether it can take work right now. Your agent picks collaborators from the roster, tells you who it used, and gives you one answer.
+Ordinary prompts do not inject the workspace roster. For an embedded `@mention`, the agent loads the Namedrop skill and resolves that exact address on demand. When collaboration without a named recipient would be useful, it can request a bounded candidate page and choose from the returned personas and live readiness. Explicit leading mentions still route directly through the hook. Skill-based automatic selection is best effort rather than a guarantee that every turn evaluates every peer.
 
-A persona grants no permissions and no tool access. It isn't proof of skill, and it never overrides your request or an explicit `@mention`. Named terminals can't have a persona.
+A persona grants no permissions and no tool access. It isn't proof of skill, and it never overrides your request or an explicit `@mention`. Directory responses treat personas as untrusted data. Named terminals can't have a persona.
 
 ## Update Namedrop
 
@@ -303,7 +305,7 @@ If your installed version has no **Update** action, finish your handoffs, exit y
 
 ### Reinstall an existing installation
 
-These steps remove Herdr's managed checkout and install the latest `main`. Your saved names and message history stay. Before you start, finish active handoffs and exit your Claude Code and Codex sessions. Keep Herdr running. In a shell tab in the workspace you want to activate, run:
+These steps remove Herdr's managed checkout and install the latest `main`. Your saved names and message history stay. Before you start, finish active handoffs and exit your Claude Code, Codex, and Kimi Code sessions. Keep Herdr running. In a shell tab in the workspace you want to activate, run:
 
 ```sh
 cd "$HOME"
@@ -345,7 +347,7 @@ Agent permissions still apply, and text from another agent never grants new ones
 
 ## Uninstall
 
-Finish active handoffs and exit your Claude Code and Codex sessions. Keep Herdr running. If several workspaces use Namedrop, run `namedrop deactivate` in each one before you disable the plugin. Then, in a Herdr shell tab, run:
+Finish active handoffs and exit your Claude Code, Codex, and Kimi Code sessions. Keep Herdr running. If several workspaces use Namedrop, run `namedrop deactivate` in each one before you disable the plugin. Then, in a Herdr shell tab, run:
 
 ```sh
 cd "$HOME"
@@ -360,7 +362,7 @@ For a local checkout or an extracted archive, use `herdr plugin unlink namedrop`
 
 ## Contributing
 
-Bug reports and focused pull requests are welcome. When you [open an issue](https://github.com/ericbust/namedrop/issues), include your Herdr, Namedrop, Codex, or Claude Code versions, the steps to reproduce, and any errors. Remove credentials and private conversation text from logs before you share them.
+Bug reports and focused pull requests are welcome. When you [open an issue](https://github.com/ericbust/namedrop/issues), include your Herdr, Namedrop, Codex, Claude Code, or Kimi Code versions, the steps to reproduce, and any errors. Remove credentials and private conversation text from logs before you share them.
 
 To build and test from source, install the [prerequisites](#install) and run:
 

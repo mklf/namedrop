@@ -1,5 +1,6 @@
 mod agent_status;
 mod agent_status_model;
+pub mod availability;
 pub mod cli;
 pub use agent_status::collect_agent_status;
 pub use agent_status_model::{suggest_agent_persona, summarize_agent_status};
@@ -7,6 +8,7 @@ mod context;
 mod controls;
 mod coordination;
 mod delivery;
+pub mod directory;
 mod domain;
 mod groups;
 mod handoff;
@@ -37,6 +39,7 @@ pub use context::{execute_context_operation, execute_human_context_operation};
 pub use controls::execute_control_operation;
 pub use delivery::{DrainReport, GraceDeadline, drain_mailboxes};
 pub(crate) use delivery::{drain_receipt, publish_status_metadata, reconcile_delivery_state};
+pub use directory::execute_directory_operation;
 pub use domain::*;
 pub use groups::execute_group_operation;
 pub use handoff::execute_handoff_operation;
@@ -44,7 +47,11 @@ pub use health::{
     HealthIssue, HealthRepair, HealthRepairKind, HealthReport, HealthSeverity, HealthStatus,
     diagnose_collaboration, render_health_report_to_text, request_doctor_assistance,
 };
-pub use hook::execute_user_prompt_submit_hook;
+pub use hook::{
+    HookContextMode, HookOutputFormat, execute_user_prompt_submit_hook,
+    execute_user_prompt_submit_hook_with_mode, format_user_prompt_submit_hook_output,
+    user_prompt_submit_requires_runtime,
+};
 pub use install::{AgentConfigDirectories, install_integration_package, package_directory};
 pub(crate) use install::{
     IntegrationPackageInstallation, disclosed_user_package_targets,
@@ -155,6 +162,8 @@ pub fn is_lifecycle_operation(operation: &str) -> bool {
             | "purge"
             | "address.create"
             | "address.list"
+            | "address.resolve"
+            | "address.candidates"
             | "address.bind"
             | "address.unbind"
             | "address.rename"

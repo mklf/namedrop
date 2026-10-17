@@ -351,6 +351,7 @@ fn upgrading_keeps_custom_descriptions_and_starts_native_names_generic() {
         .unwrap();
     drop(database);
 
+    execute_lifecycle_operation("reconcile", json!({}), &runtime).unwrap();
     let upgraded: Value = execute_lifecycle_operation("address.list", json!({}), &runtime).unwrap();
     let persona_of = |alias: &str| {
         upgraded

@@ -332,7 +332,7 @@ def preflight(live=False):
 
 def is_codex(pane):
     agent = pane.get('agent') or (pane.get('agent_session') or {}).get('agent')
-    return agent not in ('claude', 'claude-code')
+    return agent not in ('claude', 'claude-code', 'kimi', 'kimi-code')
 
 
 def labels(panes):

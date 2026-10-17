@@ -473,6 +473,44 @@ pub struct MessageRecipientDraft {
     pub delivery_id: DeliveryId,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipientExpectations {
+    #[serde(default)]
+    pub recipients: Vec<RecipientExpectation>,
+    #[serde(default)]
+    pub group_fingerprint: Option<String>,
+    #[serde(default)]
+    pub require_automatic_selection_suitable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipientExpectation {
+    pub address_id: PaneAddressId,
+    #[serde(default)]
+    pub pane_binding_id: Option<PaneBindingId>,
+    #[serde(default)]
+    pub agent_session_id: Option<AgentSessionId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayMessageInput<'a> {
+    pub authored_source: &'a str,
+    pub in_reply_to: Option<&'a MessageId>,
+    pub author_kind: ActorKind,
+    pub recipient_expectations: Option<&'a RecipientExpectations>,
+}
+
+pub fn group_membership_fingerprint(address_ids: &[PaneAddressId]) -> String {
+    let mut address_ids = address_ids.to_vec();
+    address_ids.sort();
+    format!(
+        "v1:{}",
+        serde_json::to_string(&address_ids).expect("address IDs serialize as JSON strings")
+    )
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MessageDraft {
     pub thread_id: ThreadId,
@@ -542,6 +580,7 @@ pub(crate) struct MessageRoute {
     pub thread_id: ThreadId,
     pub participants: Vec<RoutingAddressSnapshot>,
     pub reply_mode: DeliveryReplyMode,
+    pub in_reply_to: Option<MessageId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

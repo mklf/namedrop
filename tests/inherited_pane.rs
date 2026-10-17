@@ -141,11 +141,13 @@ esac
             .env("HOME", self.0.join("home"))
             .env("CLAUDE_CONFIG_DIR", self.0.join("home").join(".claude"))
             .env("CODEX_HOME", self.0.join("home").join(".codex"))
+            .env("KIMI_CODE_HOME", self.0.join("home").join(".kimi-code"))
             .env_remove("XDG_CONFIG_HOME")
             .env("CODEX_HOME", self.0.join("home/.codex"))
             .env_remove("ZDOTDIR")
             .env_remove("CODEX_SESSION_ID")
             .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("NAMEDROP_AGENT_SESSION_ID")
             .env_remove("HERDR_CONFIG_PATH")
             .env("SHELL", "/bin/zsh")
             .env("HERDR_BIN_PATH", self.0.join("herdr"))
@@ -243,6 +245,24 @@ fn an_inherited_pane_is_accepted_when_the_agent_session_runs_in_it() {
     let output = f
         .namedrop_command(&["address", "list"])
         .env("CLAUDE_CODE_SESSION_ID", "session-p1")
+        .output()
+        .unwrap();
+    other.kill().unwrap();
+    other.wait().unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed["status"], "ok", "{listed}");
+}
+
+#[test]
+fn a_kimi_session_id_vouches_for_the_inherited_pane() {
+    let f = Fixture::new("kimi-session");
+    f.activate();
+    let mut other = unrelated_process();
+    f.shell_is(other.id());
+    let output = f
+        .namedrop_command(&["address", "list"])
+        .env("NAMEDROP_AGENT_SESSION_ID", "session-p1")
         .output()
         .unwrap();
     other.kill().unwrap();
@@ -361,7 +381,7 @@ fn a_session_vouches_for_the_pane_when_the_process_is_a_child_of_init() {
 fn a_refusal_says_how_many_agent_sessions_it_checked() {
     let none = verify_inherited_pane(&LivePaneList, "wG:p21", &[]).unwrap_err();
     assert!(
-        none.contains("There is no CODEX_SESSION_ID or CLAUDE_CODE_SESSION_ID in the environment"),
+        none.contains("There is no CODEX_SESSION_ID, CLAUDE_CODE_SESSION_ID, or NAMEDROP_AGENT_SESSION_ID in the environment"),
         "{none}"
     );
     let elsewhere = verify_inherited_pane(&LivePaneList, "wG:p21", &["sess-1"]).unwrap_err();

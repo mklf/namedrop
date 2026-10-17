@@ -38,18 +38,26 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn fresh_codex_install_allows_the_required_roster_lookup() {
+fn fresh_codex_install_allows_directory_reads() {
     let f = Fixture::new();
     assert!(!f.rules().exists());
     f.install().unwrap();
     let rules = fs::read_to_string(f.rules()).unwrap();
-    let pattern = serde_json::json!([f.binary(), "--plugin-state", f.state(), "address", "list"]);
-    assert!(
-        rules.contains(&format!(
-            "prefix_rule(pattern={pattern}, decision=\"allow\""
-        )),
-        "fresh installation does not allow its required address list command: {rules}"
-    );
+    for operation in ["list", "resolve", "candidates"] {
+        let pattern = serde_json::json!([
+            f.binary(),
+            "--plugin-state",
+            f.state(),
+            "address",
+            operation
+        ]);
+        assert!(
+            rules.contains(&format!(
+                "prefix_rule(pattern={pattern}, decision=\"allow\""
+            )),
+            "fresh installation does not allow address {operation}: {rules}"
+        );
+    }
 }
 
 #[test]
@@ -60,7 +68,7 @@ fn codex_install_populates_an_empty_policy_file() {
     f.install().unwrap();
     let rules = fs::read_to_string(f.rules()).unwrap();
     assert!(rules.starts_with("# Managed by Namedrop:"));
-    assert_eq!(rules.matches("prefix_rule(").count(), 18);
+    assert_eq!(rules.matches("prefix_rule(").count(), 20);
 }
 
 #[test]
@@ -72,7 +80,7 @@ fn codex_install_refreshes_only_its_owned_policy_and_preserves_user_configuratio
     fs::write(f.0.join(".codex/config.toml"), "# user configuration\n").unwrap();
     let package = f.install().unwrap();
     let original = fs::read_to_string(f.rules()).unwrap();
-    assert_eq!(original.matches("prefix_rule(").count(), 18);
+    assert_eq!(original.matches("prefix_rule(").count(), 20);
     let modified = fs::metadata(f.rules()).unwrap().modified().unwrap();
     f.install().unwrap();
     assert_eq!(

@@ -2,9 +2,9 @@ use crate::integration::{onboard_settled_integrations, pane_agent_runtime};
 use crate::{
     ActorKind, AgentSessionId, AttentionItemRecord, Clock, HerdrCommandExecutor, IdGenerator,
     MutationAttribution, PaneAddressDraft, PaneAddressId, PaneAddressRecord, PaneBindingId,
-    PaneRoleId, PaneRolePreset, StateNamespace, StateStore, StateTransaction, StoreError,
-    WorktreeId, WorktreeState, normalize_alias, publish_status_metadata, reconcile_delivery_state,
-    validate_alias,
+    PaneBindingRecord, PaneRoleId, PaneRolePreset, StateNamespace, StateStore, StateTransaction,
+    StoreError, WorktreeId, WorktreeState, normalize_alias, publish_status_metadata,
+    reconcile_delivery_state, validate_alias,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -237,6 +237,12 @@ where
     C: Clock,
     I: IdGenerator,
 {
+    if matches!(
+        operation,
+        "address.list" | "address.resolve" | "address.candidates"
+    ) {
+        return crate::directory::execute_directory_operation(operation, input, runtime);
+    }
     let discovered = match runtime.workspace_id {
         Some(workspace_id) => discover_worktree_for_workspace(runtime.herdr, workspace_id)?,
         None => discover_worktree(runtime.herdr, runtime.cwd)?,
@@ -290,7 +296,8 @@ where
                 && agent_runtime.is_none()
             {
                 return Err(
-                    "the current pane must contain a recognized Codex or Claude session".to_owned(),
+                    "the current pane must contain a recognized Codex, Claude Code, or Kimi Code session"
+                        .to_owned(),
                 );
             }
             let registration_required = pane_type == crate::PaneType::Agent;
@@ -518,10 +525,12 @@ where
             let _ = reconcile_managed_tab_labels(&mut store, &namespace, &discovered, runtime);
             let permission_removal =
                 crate::install::remove_claude_permissions(runtime.state_directory);
+            let kimi_removal = crate::install::remove_kimi_configuration(runtime.state_directory);
             Ok(json!({
                 "space_id": discovered.workspace_id,
                 "worktree_id": discovered.worktree_attached.then_some(discovered.worktree_id),
                 "claude_permissions": {"removed": permission_removal.as_ref().is_ok_and(|count| *count > 0), "removed_entries": permission_removal.as_ref().ok(), "error": permission_removal.err()},
+                "kimi_configuration": {"removed": kimi_removal.as_ref().is_ok_and(|count| *count > 0), "removed_entries": kimi_removal.as_ref().ok(), "error": kimi_removal.err()},
                 "deactivated": true,
                 "state_preserved": true
             }))
@@ -613,40 +622,6 @@ where
                 .map_err(|error| error.to_string())?;
             onboard_settled_integrations(runtime, &discovered)?;
             serde_json::to_value(record).map_err(|error| error.to_string())
-        }
-        "address.list" => {
-            parse_input::<EmptyInput>(input)?;
-            require_activated(&mut store, &namespace)?;
-            // This is the refresh a coordinator is told to run immediately
-            // before every selection, so it must answer availability itself:
-            // a name alone cannot say whether that agent can take work now.
-            // The same load the health check and the prompt roster use supplies
-            // the two facts the record cannot carry — a live registration, and
-            // a paused space — and the roster's own function turns them into
-            // the same sentence, so there is one rule rather than two.
-            let setup = load_collaboration_setup_from_store(
-                &discovered,
-                runtime.session_socket_id,
-                &mut store,
-            )?;
-            let paused = setup
-                .worktree_state
-                .as_ref()
-                .is_some_and(|state| state.paused);
-            let records = setup
-                .addresses
-                .iter()
-                .map(|address| {
-                    let registered = setup.registered_address_ids.contains(&address.id);
-                    let mut record = serde_json::to_value(address)?;
-                    record["registered"] = Value::Bool(registered);
-                    record["selection"] =
-                        crate::persona::selection_note(address, registered, paused).into();
-                    Ok(record)
-                })
-                .collect::<Result<Vec<Value>, serde_json::Error>>()
-                .map_err(|error| error.to_string())?;
-            serde_json::to_value(records).map_err(|error| error.to_string())
         }
         "address.bind" => {
             let input: BindInput = parse_input(input)?;
@@ -1824,49 +1799,130 @@ pub(crate) struct CollaborationSetup {
     pub attention_items: Vec<AttentionItemRecord>,
 }
 
+/// Directory-only state loaded in the same transaction as the base setup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectorySetup {
+    pub collaboration: CollaborationSetup,
+    pub readiness:
+        std::collections::BTreeMap<PaneAddressId, crate::availability::RecipientReadiness>,
+    pub groups: Vec<Value>,
+    pub bindings: Vec<PaneBindingRecord>,
+    pub capabilities: std::collections::BTreeMap<PaneAddressId, Vec<String>>,
+}
+
+impl std::ops::Deref for DirectorySetup {
+    type Target = CollaborationSetup;
+
+    fn deref(&self) -> &Self::Target {
+        &self.collaboration
+    }
+}
+
 pub(crate) fn load_collaboration_setup_from_store(
     discovered: &DiscoveredWorktree,
     session_socket_id: &str,
     store: &mut StateStore,
 ) -> Result<CollaborationSetup, String> {
-    let namespace = discovered.namespace(session_socket_id);
-    let (worktree_state, addresses, registered_address_ids, attention_items) = store
+    store
         .transaction(|transaction| {
-            let worktree_state = transaction.worktree_state(&namespace)?;
-            let addresses = transaction
-                .list_pane_addresses(&namespace)?
-                .into_iter()
-                .map(|record| enrich_record(record, &discovered.panes))
-                .collect::<Vec<_>>();
-            let mut registered = Vec::new();
-            for address in &addresses {
-                if let Some(agent_session_id) = &address.agent_session_id
-                    && discovered.panes.iter().any(|pane| {
-                        address.pane_id.as_deref() == Some(pane.pane_id.as_str())
-                            && pane.agent_session_id.as_ref() == Some(agent_session_id)
-                            && pane_agent_runtime(pane).is_some()
-                    })
-                    && transaction
-                        .active_integration_registration(&namespace, &address.id, agent_session_id)?
-                        .is_some()
-                {
-                    registered.push(address.id.clone());
-                }
-            }
-            Ok((
-                worktree_state,
-                addresses,
-                registered,
-                transaction.unresolved_attention_items(&namespace)?,
-            ))
+            load_collaboration_setup(transaction, discovered, session_socket_id)
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn load_directory_setup_from_store(
+    discovered: &DiscoveredWorktree,
+    session_socket_id: &str,
+    store: &mut StateStore,
+    shell_availability: &std::collections::BTreeMap<String, bool>,
+) -> Result<DirectorySetup, String> {
+    store
+        .transaction(|transaction| {
+            load_directory_setup(
+                transaction,
+                discovered,
+                session_socket_id,
+                shell_availability,
+            )
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn load_collaboration_setup(
+    transaction: &StateTransaction<'_>,
+    discovered: &DiscoveredWorktree,
+    session_socket_id: &str,
+) -> Result<CollaborationSetup, StoreError> {
+    let namespace = discovered.namespace(session_socket_id);
+    let worktree_state = transaction.worktree_state(&namespace)?;
+    let addresses = transaction
+        .list_pane_addresses(&namespace)?
+        .into_iter()
+        .map(|record| enrich_record(record, &discovered.panes))
+        .collect::<Vec<_>>();
+    let mut registered_address_ids = Vec::new();
+    for address in &addresses {
+        if let Some(agent_session_id) = &address.agent_session_id
+            && discovered.panes.iter().any(|pane| {
+                address.pane_id.as_deref() == Some(pane.pane_id.as_str())
+                    && pane.agent_session_id.as_ref() == Some(agent_session_id)
+                    && pane_agent_runtime(pane).is_some()
+            })
+            && transaction
+                .active_integration_registration(&namespace, &address.id, agent_session_id)?
+                .is_some()
+        {
+            registered_address_ids.push(address.id.clone());
+        }
+    }
+    let attention_items = transaction.unresolved_attention_items(&namespace)?;
     Ok(CollaborationSetup {
         worktree_state,
         panes: discovered.panes.clone(),
         addresses,
         registered_address_ids,
         attention_items,
+    })
+}
+
+pub(crate) fn load_directory_setup(
+    transaction: &StateTransaction<'_>,
+    discovered: &DiscoveredWorktree,
+    session_socket_id: &str,
+    shell_availability: &std::collections::BTreeMap<String, bool>,
+) -> Result<DirectorySetup, StoreError> {
+    let collaboration = load_collaboration_setup(transaction, discovered, session_socket_id)?;
+    let namespace = discovered.namespace(session_socket_id);
+    let mut readiness = std::collections::BTreeMap::new();
+    for address in &collaboration.addresses {
+        readiness.insert(
+            address.id.clone(),
+            transaction.recipient_readiness(
+                &namespace,
+                discovered,
+                &address.id,
+                None,
+                shell_availability,
+            )?,
+        );
+    }
+    let groups = transaction.list_mention_groups(&namespace)?;
+    let bindings = transaction.active_pane_bindings(&namespace)?;
+    let mut capabilities = std::collections::BTreeMap::new();
+    for address in &collaboration.addresses {
+        if let Some(session) = address.agent_session_id.as_ref()
+            && let Some(registration) =
+                transaction.active_integration_registration(&namespace, &address.id, session)?
+        {
+            capabilities.insert(address.id.clone(), registration.capabilities);
+        }
+    }
+    Ok(DirectorySetup {
+        collaboration,
+        readiness,
+        groups,
+        bindings,
+        capabilities,
     })
 }
 

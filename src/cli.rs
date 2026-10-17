@@ -112,6 +112,24 @@ impl Cli {
         }
     }
 
+    pub fn user_prompt_submit_hook_format(&self) -> crate::HookOutputFormat {
+        match &self.command {
+            Command::Hook {
+                command: HookCommand::UserPromptSubmit(args),
+            } => args.format,
+            _ => crate::HookOutputFormat::default(),
+        }
+    }
+
+    pub fn user_prompt_submit_hook_context_mode(&self) -> crate::HookContextMode {
+        match &self.command {
+            Command::Hook {
+                command: HookCommand::UserPromptSubmit(args),
+            } => args.context_mode,
+            _ => crate::HookContextMode::default(),
+        }
+    }
+
     pub fn mailbox_wake_hook_state_directory(&self) -> Option<&Path> {
         match &self.command {
             Command::Hook {
@@ -439,6 +457,10 @@ enum AddressCommand {
     Create,
     /// List this space's names and live agents.
     List,
+    /// Resolve exact aliases, groups, or this pane without changing state.
+    Resolve,
+    /// Discover bounded collaborator or terminal candidates without changing state.
+    Candidates,
     /// Bind a name to a live Herdr pane.
     Bind,
     /// Unbind a name from its pane.
@@ -464,6 +486,8 @@ impl AddressCommand {
         match self {
             Self::Create => "address.create",
             Self::List => "address.list",
+            Self::Resolve => "address.resolve",
+            Self::Candidates => "address.candidates",
             Self::Bind => "address.bind",
             Self::Unbind => "address.unbind",
             Self::Rename => "address.rename",
@@ -603,6 +627,10 @@ struct HookArgs {
     /// Plugin-owned state directory for this installed hook.
     #[arg(long, value_name = "PATH")]
     state_directory: PathBuf,
+    #[arg(long, value_enum, default_value_t)]
+    format: crate::HookOutputFormat,
+    #[arg(long = "context-mode", value_enum, default_value_t)]
+    context_mode: crate::HookContextMode,
 }
 
 #[cfg(test)]

@@ -1,11 +1,11 @@
 ---
 name: verify
-description: Drive Namedrop's Rust CLI and terminal UI in disposable native Herdr panes, capture evidence, and verify naming, personas, groups, controls, tours, and collaboration behavior after changes.
+description: Drive Namedrop's Rust CLI and terminal UI in disposable native Herdr panes, capture evidence, and verify naming, on-demand directory, zero prompt context, personas, groups, controls, tours, and collaboration behavior after changes.
 ---
 
 # Verify Namedrop
 
-Read [the feature index](features/README.md), then the matching recipe. The primary user interface is the Namedrop CLI and Herdr terminal popups. Agent hooks and authenticated Codex/Claude sessions are additional entry points. Installation success, hook output, and an agent round trip are separate proofs.
+Read [the feature index](features/README.md), then the matching recipe. The primary user interface is the Namedrop CLI and Herdr terminal popups. Agent hooks and authenticated Codex/Claude/Kimi Code sessions are additional entry points. Installation success, hook output, and an agent round trip are separate proofs.
 
 ## Launch
 
@@ -34,6 +34,7 @@ Exit `0` means healthy, `1` means needs attention, and `2` means unavailable. Th
 
 ```sh
 .agents/skills/verify/scripts/control-namedrop.py --feature names
+.agents/skills/verify/scripts/control-namedrop.py --feature directory
 .agents/skills/verify/scripts/control-namedrop.py --feature groups
 .agents/skills/verify/scripts/control-namedrop.py --feature controls
 .agents/skills/verify/scripts/control-namedrop.py --feature tour
@@ -85,6 +86,6 @@ After a run, inspect the printed directory's `summary.json` and `cleanup.json`, 
 
 ## Helpers
 
-`scripts/control-namedrop.py` is executable. Run it from the repository root as shown above; `--help` lists its nine recipes and `--binary` option. It uses only Python's standard library. Add new drives at public CLI or terminal entry points, rather than setting application state internally.
+`scripts/control-namedrop.py` is executable. Run it from the repository root as shown above; `--help` lists its ten recipes and `--binary` option. It uses only Python's standard library. Add new drives at public CLI or terminal entry points, rather than setting application state internally.
 
 Use `/maintain-verification-skill` to reconcile the feature map and recipes as Namedrop changes.

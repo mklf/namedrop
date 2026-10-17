@@ -77,6 +77,7 @@ print(json.dumps({'result':result}))
             .env("HOME", &self.home)
             .env("CLAUDE_CONFIG_DIR", &self.claude)
             .env("CODEX_HOME", self.home.join(".codex"))
+            .env("KIMI_CODE_HOME", self.home.join(".kimi-code"))
             .env("HERDR_BIN_PATH", self.root.join("herdr"))
             .env("TEST_WORKSPACE", workspace);
         command
@@ -108,6 +109,7 @@ print(json.dumps({'result':result}))
             agent_config: namedrop::AgentConfigDirectories {
                 claude: Some(&self.claude),
                 codex: None,
+                kimi: None,
             },
             cwd: Path::new("/repo"),
             workspace_id: None,
@@ -150,6 +152,8 @@ print(json.dumps({'result':result}))
             "handoff resolve",
             "handoff adopt",
             "address list",
+            "address resolve",
+            "address candidates",
         ]
         .into_iter()
         .map(|operation| {
@@ -278,7 +282,7 @@ fn reactivation_is_idempotent_and_deactivation_keeps_identical_user_rules() {
     f.activate();
     assert_eq!(
         f.read()["permissions"]["allow"].as_array().unwrap().len(),
-        19
+        21
     );
     let before = fs::read(f.settings()).unwrap();
     let modified = fs::metadata(f.settings()).unwrap().modified().unwrap();
@@ -310,12 +314,12 @@ fn runtime_path_change_removes_old_managed_rules_only() {
     install_integration_package(&f.home, AgentRuntime::ClaudeCode, &first, &f.root).unwrap();
     assert_eq!(
         f.read()["permissions"]["allow"].as_array().unwrap().len(),
-        19
+        21
     );
     let next = f.root.join("next runtime/namedrop");
     install_integration_package(&f.home, AgentRuntime::ClaudeCode, &next, &f.root).unwrap();
     let allow = f.read()["permissions"]["allow"].as_array().unwrap().clone();
-    assert_eq!(allow.len(), 19);
+    assert_eq!(allow.len(), 21);
     assert_eq!(allow[0], "Read");
     assert!(
         !allow
@@ -404,7 +408,7 @@ fn config_directory_override_is_isolated_from_the_default_profile() {
     f.activate();
     assert_eq!(
         f.read()["permissions"]["allow"].as_array().unwrap().len(),
-        19
+        21
     );
     f.deactivate();
     assert_eq!(f.read()["permissions"]["allow"], json!(["Read"]));
@@ -510,7 +514,7 @@ fn deactivating_one_of_two_worktrees_keeps_shared_permissions() {
     assert_eq!(fs::read(f.settings()).unwrap(), before);
     let second = f.run_for("workspace-2", "deactivate", json!({}));
     assert_eq!(second["claude_permissions"]["removed"], true);
-    assert_eq!(second["claude_permissions"]["removed_entries"], 18);
+    assert_eq!(second["claude_permissions"]["removed_entries"], 20);
     assert_eq!(f.read()["permissions"]["allow"], json!([]));
 }
 
@@ -616,6 +620,7 @@ fn input_file_errors_never_echo_unknown_keys_or_values() {
                 .env("HOME", &f.home)
                 .env("CLAUDE_CONFIG_DIR", f.home.join(".claude"))
                 .env("CODEX_HOME", f.home.join(".codex"))
+                .env("KIMI_CODE_HOME", f.home.join(".kimi-code"))
                 .output()
                 .unwrap();
             assert!(!output.status.success());
@@ -677,6 +682,7 @@ fn an_inherited_claude_config_directory_is_not_used_by_in_process_helpers() {
         .env("HOME", &f.home)
         .env("CLAUDE_CONFIG_DIR", parent)
         .env("CODEX_HOME", f.home.join(".codex"))
+        .env("KIMI_CODE_HOME", f.home.join(".kimi-code"))
         .output()
         .unwrap();
     assert!(result.status.success(), "{result:?}");
@@ -864,6 +870,7 @@ fn input_file_operational_errors_match_inline_errors() {
         .env("HOME", &f.home)
         .env("CLAUDE_CONFIG_DIR", &f.claude)
         .env("CODEX_HOME", f.home.join(".codex"))
+        .env("KIMI_CODE_HOME", f.home.join(".kimi-code"))
         .env("HERDR_BIN_PATH", f.root.join("herdr"))
         .env("TEST_WORKSPACE", "workspace-1")
         .env("TEST_PEER_PANE", "1")
@@ -927,7 +934,7 @@ fn assert_permission_fallback(f: &Fixture, activation: &Value) {
             .unwrap();
     assert!(!skill.contains("allowed-tools:"), "{skill}");
     assert!(
-        skill.contains("reactivate") && skill.contains("grants no permissions"),
+        skill.contains("fresh-session") && skill.contains("grants no permissions"),
         "{skill}"
     );
     let report = f.doctor();
@@ -1038,8 +1045,8 @@ fn reactivation_removes_an_owned_environment_bootstrap_rule() {
         !allow.contains(&unsafe_rule),
         "reactivation retained the owned environment bootstrap: {allow:?}"
     );
-    assert_eq!(&allow[..18], f.expected());
-    assert_eq!(allow[18], "Read");
+    assert_eq!(&allow[..20], f.expected());
+    assert_eq!(allow[20], "Read");
     let owned: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
     assert!(!owned["entries"].as_array().unwrap().contains(&unsafe_rule));
     f.deactivate();
@@ -1063,6 +1070,7 @@ fn registration_flags_override_every_inherited_transport_value() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_namedrop"))
         .args(["--plugin-state", f.root.to_str().unwrap(), "register", "--herdr-socket", "socket-a", "--herdr-workspace", "workspace-1", "--herdr-pane", "pane-1", "--input-json", &json!({"runtime":"claude-code", "protocol_version":"collab/v1", "nonce":challenge.nonce, "capabilities":complete_capability_profile()}).to_string()])
         .env("HOME", &f.home).env("CLAUDE_CONFIG_DIR", &f.claude).env("CODEX_HOME", f.home.join(".codex"))
+            .env("KIMI_CODE_HOME", f.home.join(".kimi-code"))
         .env("HERDR_BIN_PATH", f.root.join("herdr")).env("TEST_WORKSPACE", "workspace-1")
         .env("HERDR_PLUGIN_STATE_DIR", f.root.join("wrong-state")).env("HERDR_SOCKET_PATH", "wrong-socket")
         .env("HERDR_WORKSPACE_ID", "wrong-workspace").env("HERDR_PANE_ID", "wrong-pane")

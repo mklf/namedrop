@@ -57,7 +57,7 @@ def main():
     binary = Path(os.environ.get('NAMEDROP_TEST_BINARY', REPO / 'target/debug/namedrop')).resolve()
     previous = Path(os.environ.get('NAMEDROP_TEST_PREVIOUS_BINARY', binary)).resolve()
     base = Path(tempfile.mkdtemp(prefix='namedrop-native-update-', dir=FIXTURE_ROOT))
-    env = {k: v for k, v in os.environ.items() if not k.startswith(('HERDR_', 'CODEX_', 'CLAUDE_', 'NAMEDROP_', 'GIT_CONFIG_'))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('HERDR_', 'CODEX_', 'CLAUDE_', 'KIMI_', 'NAMEDROP_', 'GIT_CONFIG_'))}
     # Setup runs any codex on PATH, which would install the plugin before the check that it is still missing.
     env['PATH'] = os.pathsep.join(d for d in env['PATH'].split(os.pathsep) if not os.access(os.path.join(d, 'codex'), os.X_OK))
     for name in ('home', 'config', 'state', 'data', 'run', 'workspace', 'remote', 'evidence'):
@@ -65,6 +65,7 @@ def main():
     env.update(HOME=str(base/'home'), XDG_CONFIG_HOME=str(base/'config'), XDG_STATE_HOME=str(base/'state'),
                XDG_DATA_HOME=str(base/'data'), XDG_RUNTIME_DIR=str(base/'run'),
                CODEX_HOME=str(base/'home/.codex'), CLAUDE_CONFIG_DIR=str(base/'home/.claude'),
+               KIMI_CODE_HOME=str(base/'home/.kimi-code'),
                GIT_CONFIG_GLOBAL=str(base/'home/.gitconfig'), HERDR_SOCKET_PATH=str(base/'run/herdr.sock'),
                **fixture_shell(base/'home'))
     def command(*args, context=None, check=True, timeout=60):
@@ -233,8 +234,9 @@ def main():
         (base/'evidence/update.txt').write_text(output())
         after = host('plugin','list','--plugin','namedrop','--json')['result']['plugins'][0]
         assert registry['source']['resolved_commit'] == first and after['source']['resolved_commit'] == second
-        for field in ('kind','owner','repo','requested_ref','managed_path','subdir'):
+        for field in ('kind','owner','repo','requested_ref','subdir'):
             assert registry['source'].get(field) == after['source'].get(field), field
+        assert after['source']['managed_path'] == after['plugin_root']
         assert (state/'runtime/current').resolve() != current_before and current_before.is_dir()
         assert hashlib.sha256((state/'runtime/current/namedrop').read_bytes()).hexdigest() == digests['two']
         live = host('pane','list')['result']['panes']

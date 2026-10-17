@@ -167,7 +167,7 @@ def safe(value):
     return "".join(c if c.isprintable() else ascii(c)[1:-1] for c in str(value))
 
 def step(value, prefix="  • "):
-    if str(value).startswith(("codex ", "herdr ", "claude ")):
+    if str(value).startswith(("codex ", "herdr ", "claude ", "kimi ")):
         print("    " + safe(value))
         return
     print(textwrap.fill(safe(value), width=92, initial_indent=prefix, subsequent_indent="    "))
@@ -241,7 +241,7 @@ def show_report(payload):
             step("After Codex setup, reopen Activate Namedrop before starting fresh Codex sessions. This completes the one-time migration.")
         return
     for line in native.splitlines():
-        if line.startswith(("codex:", "claude:")):
+        if line.startswith(("codex:", "claude:", "kimi:")):
             step("Herdr " + line)
     print("\nNext steps — for the runtimes you use")
     step("Start fresh agent sessions after setup. Installation alone does not verify loaded hooks; confirm a request and reply between agents.")
@@ -256,7 +256,7 @@ def show_report(payload):
     for instruction in data.get("setup_steps", []):
         step(instruction)
     print("  Native hooks, if setup is needed (choose your runtime):")
-    print("    herdr integration install codex\n    herdr integration install claude")
+    print("    herdr integration install codex\n    herdr integration install claude\n    herdr integration install kimi")
     command = data.get("shell_command")
     if command:
         step(command["next_step"])

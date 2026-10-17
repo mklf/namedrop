@@ -2288,19 +2288,24 @@ impl StateTransaction<'_> {
         Ok(())
     }
 
-    pub(crate) fn replay_message(
+    pub(crate) fn replay_message_with_expectations(
         &self,
         namespace: &StateNamespace,
         author_address_id: &PaneAddressId,
         request_id: &str,
-        authored_source: &str,
-        in_reply_to: Option<&MessageId>,
-        author_kind: ActorKind,
+        replay: crate::ReplayMessageInput,
     ) -> Result<Option<RoutedMessageReceipt>, StoreError> {
+        let crate::ReplayMessageInput {
+            authored_source,
+            in_reply_to,
+            author_kind,
+            recipient_expectations,
+        } = replay;
         let existing = self
             .transaction
             .query_row(
-                "SELECT m.message_id, m.authored_source, m.in_reply_to, m.author_kind
+                "SELECT m.message_id, m.authored_source, m.in_reply_to, m.author_kind,
+                        i.request_fingerprint
                  FROM idempotency_records i
                  JOIN collaboration_messages m
                    ON m.session_socket_id = i.session_socket_id
@@ -2320,11 +2325,14 @@ impl StateTransaction<'_> {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((message_id, stored_source, stored_reply, stored_author_kind)) = existing else {
+        let Some((message_id, stored_source, stored_reply, stored_author_kind, stored_fingerprint)) =
+            existing
+        else {
             return Ok(None);
         };
         if stored_source != authored_source
@@ -2333,6 +2341,18 @@ impl StateTransaction<'_> {
         {
             return Err(StoreError::invalid_input(
                 "request id was already used for different message content",
+            ));
+        }
+        let stored_fingerprint: serde_json::Value = serde_json::from_str(&stored_fingerprint)
+            .map_err(|error| StoreError::invalid_input(error.to_string()))?;
+        let stored_expectations = stored_fingerprint.get("recipient_expectations").cloned();
+        let recipient_expectations = recipient_expectations
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| StoreError::invalid_input(error.to_string()))?;
+        if stored_expectations != recipient_expectations {
+            return Err(StoreError::invalid_input(
+                "request id was already used for different recipient expectations",
             ));
         }
         let message_id = MessageId::new(message_id);
@@ -2362,11 +2382,11 @@ impl StateTransaction<'_> {
         namespace: &StateNamespace,
         message_id: &MessageId,
     ) -> Result<MessageRoute, StoreError> {
-        let (thread_id, author, grammar_version) = self
+        let (thread_id, author, grammar_version, in_reply_to) = self
             .transaction
             .query_row(
                 "SELECT thread_id, author_address_id, author_alias_snapshot,
-                        author_session_snapshot, grammar_version
+                        author_session_snapshot, grammar_version, in_reply_to
                  FROM collaboration_messages
                  WHERE session_socket_id = ?1 AND worktree_id = ?2 AND message_id = ?3",
                 params![
@@ -2386,6 +2406,7 @@ impl StateTransaction<'_> {
                                 .map(crate::AgentSessionId::new),
                         },
                         row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
@@ -2410,6 +2431,7 @@ impl StateTransaction<'_> {
             thread_id,
             participants,
             reply_mode: crate::DeliveryReplyMode::for_message_grammar(&grammar_version),
+            in_reply_to: in_reply_to.map(MessageId::new),
         })
     }
 
@@ -2419,7 +2441,17 @@ impl StateTransaction<'_> {
         draft: &MessageDraft,
         attribution: &MutationAttribution,
     ) -> Result<MessageReceipt, StoreError> {
-        let fingerprint = serde_json::to_string(&serde_json::json!({
+        self.append_message_with_expectations(namespace, draft, attribution, None)
+    }
+
+    pub fn append_message_with_expectations(
+        &mut self,
+        namespace: &StateNamespace,
+        draft: &MessageDraft,
+        attribution: &MutationAttribution,
+        recipient_expectations: Option<&crate::RecipientExpectations>,
+    ) -> Result<MessageReceipt, StoreError> {
+        let mut fingerprint = serde_json::json!({
             "in_reply_to": draft.in_reply_to.as_ref().map(MessageId::as_str),
             "author_address_id": draft.author_address_id.as_str(),
             "author_kind": draft.author_kind.as_str(),
@@ -2434,8 +2466,13 @@ impl StateTransaction<'_> {
                     "address_id": reference.address_id.as_str(),
                 })
             }).collect::<Vec<_>>(),
-        }))
-        .map_err(|error| StoreError::invalid_input(error.to_string()))?;
+        });
+        if let Some(expectations) = recipient_expectations {
+            fingerprint["recipient_expectations"] = serde_json::to_value(expectations)
+                .map_err(|error| StoreError::invalid_input(error.to_string()))?;
+        }
+        let fingerprint = serde_json::to_string(&fingerprint)
+            .map_err(|error| StoreError::invalid_input(error.to_string()))?;
         let existing = self
             .transaction
             .query_row(

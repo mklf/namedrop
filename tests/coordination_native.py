@@ -44,6 +44,7 @@ def isolated_env(base):
     env.update(HOME=str(base/'home'), XDG_CONFIG_HOME=str(base/'config'), XDG_STATE_HOME=str(base/'state'),
                XDG_DATA_HOME=str(base/'data'), XDG_RUNTIME_DIR=str(base/'run'),
                CODEX_HOME=str(base/'home/.codex'), CLAUDE_CONFIG_DIR=str(base/'home/.claude'),
+               KIMI_CODE_HOME=str(base/'home/.kimi-code'),
                GIT_CONFIG_GLOBAL=str(base/'home/.gitconfig'), GIT_CONFIG_NOSYSTEM='1',
                HERDR_SOCKET_PATH=str(base/'run/herdr.sock'), **fixture_shell(base/'home'))
     return env

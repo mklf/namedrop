@@ -132,7 +132,11 @@ where
     }
     let mut failed_packages = Vec::new();
     let mut inspected_packages = Vec::new();
-    for agent_runtime in [crate::AgentRuntime::Codex, crate::AgentRuntime::ClaudeCode] {
+    for agent_runtime in [
+        crate::AgentRuntime::Codex,
+        crate::AgentRuntime::ClaudeCode,
+        crate::AgentRuntime::KimiCode,
+    ] {
         if !setup
             .panes
             .iter()
@@ -166,7 +170,7 @@ where
             package_issue.diagnostic = serde_json::json!({
                 "source_id": crate::integration_package_attention_source(agent_runtime),
                 "runtime": agent_runtime,
-                "path": runtime.home_directory.map(|home| crate::package_directory(home, agent_runtime)),
+                "path": runtime.home_directory.map(|home| crate::install::package_directory_with_config(home, agent_runtime, runtime.agent_config)),
             });
             add_operation(
                 &mut package_issue,
@@ -375,7 +379,7 @@ where
             "ND-SETUP-003",
             HealthSeverity::Blocked,
             "No supported agents are open in this space.",
-            "Start Codex or Claude Code in a Herdr pane, then check again.",
+            "Start Codex, Claude Code, or Kimi Code in a Herdr pane, then check again.",
             HealthRepairKind::ProductAction,
             "Start an agent in this space?",
         ));

@@ -39,6 +39,8 @@ struct PreviewInput {
     #[serde(default)]
     mode: PreviewMode,
     context: Option<crate::context::MessageContextInput>,
+    #[serde(default)]
+    recipient_expectations: Option<crate::RecipientExpectations>,
 }
 
 /// Read request progress and replies without running recovery or dispatch.
@@ -100,12 +102,16 @@ where
     let mut store = StateStore::open_read_only(runtime.state_directory)
         .map_err(|e| e.to_string())?
         .ok_or("Namedrop has no saved state")?;
+    let addresses = store
+        .transaction(|transaction| transaction.list_pane_addresses(&namespace))
+        .map_err(|error| error.to_string())?;
+    let shell_availability = crate::terminal::shell_availability(runtime.herdr, &addresses);
     store.transaction(|tx| {
         let author = crate::context::registered_current_address(tx, &namespace, pane, &discovered)?;
         if let Some(id) = coordination_id { return tx.coordination_report(&namespace,&id,&author); }
         if let Some(message_id) = message_id {
             let mut report = tx.handoff_report(&namespace, &author, &message_id, runtime.clock.now_unix_ms(), true)?;
-            tx.add_handoff_outlooks(&namespace, &discovered, &mut report)?;
+            tx.add_handoff_outlooks(&namespace, &discovered, &mut report, &shell_availability)?;
             for recipient in report["recipients"].as_array_mut().unwrap() {
                 if recipient["result_status"]=="replied" {
                     let address = crate::PaneAddressId::new(recipient["target"]["address_id"].as_str().unwrap());
@@ -135,7 +141,7 @@ where
             ids.truncate(status.limit as usize);
             let reports = ids.iter().map(|id| {
                 let mut report = tx.handoff_report(&namespace, &author, id, runtime.clock.now_unix_ms(), false)?;
-                tx.add_handoff_outlooks(&namespace, &discovered, &mut report)?;
+                tx.add_handoff_outlooks(&namespace, &discovered, &mut report, &shell_availability)?;
                 Ok(report)
             })
                 .collect::<Result<Vec<_>, crate::StoreError>>()?;
@@ -161,6 +167,10 @@ where
             crate::parse_prompt_mentions(&input.source)?
         }
     };
+    let recipient_expectations = input
+        .recipient_expectations
+        .map(crate::message::normalize_recipient_expectations)
+        .transpose()?;
     // The Space is resolved before the context block is previewed, so the
     // preview answers for the same context root the send would capture against.
     let discovered = match runtime.workspace_id {
@@ -178,10 +188,32 @@ where
     let mut store = StateStore::open_read_only(runtime.state_directory)
         .map_err(|e| e.to_string())?
         .ok_or("Namedrop has no saved state")?;
+    let addresses = store
+        .transaction(|transaction| transaction.list_pane_addresses(&namespace))
+        .map_err(|error| error.to_string())?;
+    let shell_availability = crate::terminal::shell_availability(runtime.herdr, &addresses);
     store.transaction(|tx| {
         let author = crate::context::registered_current_address(tx,&namespace,pane,&discovered)?;
         let recipients = tx.resolve_message_recipients(&namespace,&parsed.recipient_aliases,&author.address_id)?;
-        let recipients = recipients.iter().map(|r|tx.recipient_preview(&namespace,&discovered,&r.address_id,None)).collect::<Result<Vec<_>,_>>()?;
+        if let Some(expectations) = recipient_expectations.as_ref() {
+            let addresses = tx.list_pane_addresses(&namespace)?;
+            crate::message::validate_resolved_recipient_expectations(
+                expectations,
+                &recipients,
+                &addresses,
+                &discovered,
+            )
+            .map_err(crate::StoreError::invalid_input)?;
+            crate::message::validate_recipient_capacity(
+                expectations,
+                &recipients,
+                tx,
+                &namespace,
+                &discovered,
+                &shell_availability,
+            )?;
+        }
+        let recipients = recipients.iter().map(|r|tx.recipient_preview(&namespace,&discovered,&r.address_id,None,&shell_availability)).collect::<Result<Vec<_>,_>>()?;
         let references = parsed.context_reference_aliases.iter().map(|alias| {
             let address = tx.resolve_routing_alias(&namespace,alias)?;
             Ok(json!({"address_id":address.address_id,"alias":address.alias}))

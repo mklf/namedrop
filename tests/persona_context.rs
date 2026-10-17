@@ -1,12 +1,13 @@
-//! What the installed hook actually hands a native session at a prompt or task
-//! boundary: the current workspace persona roster, without changing how explicit
-//! Mentions route or how a Delivery Envelope authenticates.
+//! On-demand prompts emit no roster, while explicit Mentions and authenticated
+//! deliveries retain their routing and bound-control behavior.
 use namedrop::{
     ActorKind, AgentRuntime, AgentSessionId, Clock, HerdrCommandExecutor, HerdrCommandOutput,
-    IdGenerator, LifecycleRuntime, MutationAttribution, PaneAddressDraft, PaneAddressId,
-    PaneBindingId, PaneRoleId, StateNamespace, StateStore, complete_capability_profile,
-    execute_integration_operation, execute_lifecycle_operation, execute_message_operation,
-    execute_user_prompt_submit_hook, install_integration_package, issue_registration_challenge,
+    HookContextMode, IdGenerator, LifecycleRuntime, MutationAttribution, PaneAddressDraft,
+    PaneAddressId, PaneBindingId, PaneRoleId, StateNamespace, StateStore,
+    complete_capability_profile, execute_handoff_operation, execute_integration_operation,
+    execute_lifecycle_operation, execute_message_operation, execute_user_prompt_submit_hook,
+    execute_user_prompt_submit_hook_with_mode, install_integration_package,
+    issue_registration_challenge,
 };
 use serde_json::{Value, json};
 use std::{
@@ -24,6 +25,7 @@ const MISS_GUIDANCE: &str = "Namedrop could not resolve at least one leading rec
 /// The other one: a handoff that could not be confirmed at all.
 const UNCONFIRMED_GUIDANCE: &str = "Namedrop could not confirm the leading Mention handoff. The prompt was preserved for you unchanged; do not retry automatically. Continue locally or ask the person to retry after collaboration is available.";
 const DELIVERY_MARKER: &str = "Namedrop verification:";
+const DELIVERY_COMMANDS_MARKER: &str = "Namedrop delivery commands.";
 /// The opening of the runnable command block the hook adds beside an
 /// authenticated delivery. It never appears inside the envelope itself.
 const COMMAND_MARKER: &str = "Namedrop commands:";
@@ -69,8 +71,10 @@ struct FakeHerdr {
     worktree: String,
     /// Serialized Delivery Envelopes handed to `agent prompt`, per pane.
     prompts: std::sync::Mutex<Vec<(String, String)>>,
+    ui_events: std::sync::Mutex<Vec<String>>,
     /// Every command run, so a test can prove one was never needed.
     commands: AtomicU64,
+    worktree_calls: AtomicU64,
 }
 
 impl FakeHerdr {
@@ -78,12 +82,22 @@ impl FakeHerdr {
         Self {
             worktree: directory.repo.display().to_string(),
             prompts: std::sync::Mutex::new(Vec::new()),
+            ui_events: std::sync::Mutex::new(Vec::new()),
             commands: AtomicU64::new(0),
+            worktree_calls: AtomicU64::new(0),
         }
     }
 
     fn commands(&self) -> u64 {
         self.commands.load(Ordering::Relaxed)
+    }
+
+    fn worktree_calls(&self) -> u64 {
+        self.worktree_calls.load(Ordering::Relaxed)
+    }
+
+    fn ui_events(&self) -> Vec<String> {
+        self.ui_events.lock().unwrap().clone()
     }
 
     fn envelope_for(&self, pane_id: &str) -> Value {
@@ -103,10 +117,13 @@ impl HerdrCommandExecutor for FakeHerdr {
         let stdout = match args {
             ["workspace", "list"] => json!({"result":{"workspaces":[{"workspace_id":"workspace-1"}]}})
             .to_string(),
-            ["worktree", "list", "--cwd", cwd, "--json"] if *cwd == self.worktree => json!({
-                "result": {"worktrees": [{"path": self.worktree, "open_workspace_id": "workspace-1"}]}
-            })
-            .to_string(),
+            ["worktree", "list", "--cwd", cwd, "--json"] if *cwd == self.worktree => {
+                self.worktree_calls.fetch_add(1, Ordering::Relaxed);
+                json!({
+                    "result": {"worktrees": [{"path": self.worktree, "open_workspace_id": "workspace-1"}]}
+                })
+                .to_string()
+            }
             ["pane", "list", "--workspace", "workspace-1"] => json!({"result": {"panes": [
                 {"pane_id":"pane-lead","terminal_id":"t1","tab_id":"tab-1","workspace_id":"workspace-1",
                  "agent":"codex","agent_session":{"value":"session-lead"},"agent_status":"idle"},
@@ -123,6 +140,14 @@ impl HerdrCommandExecutor for FakeHerdr {
                     .lock()
                     .unwrap()
                     .push(((*pane_id).to_owned(), (*envelope).to_owned()));
+                "{}".to_owned()
+            }
+            ["notification", "show", _, "--body", body, "--position", "bottom-right"] => {
+                self.ui_events.lock().unwrap().push((*body).to_owned());
+                "{}".to_owned()
+            }
+            ["pane", "report-metadata", _, "--source", "namedrop-hook", "--token", token, "--ttl-ms", "15000"] => {
+                self.ui_events.lock().unwrap().push((*token).to_owned());
                 "{}".to_owned()
             }
             ["pane", "report-metadata", ..] => "{}".to_owned(),
@@ -260,6 +285,17 @@ fn hook(
     )
 }
 
+fn legacy_hook(
+    prompt: &str,
+    runtime: &LifecycleRuntime<'_, FakeHerdr, FixedClock, SequenceIds>,
+) -> Option<Value> {
+    execute_user_prompt_submit_hook_with_mode(
+        &json!({"hook_event_name":"UserPromptSubmit","prompt":prompt}).to_string(),
+        runtime,
+        HookContextMode::LegacyEager,
+    )
+}
+
 fn context(output: &Value) -> String {
     output
         .pointer("/hookSpecificOutput/additionalContext")
@@ -269,7 +305,29 @@ fn context(output: &Value) -> String {
 }
 
 #[test]
-fn an_ordinary_turn_carries_the_workspace_personas_generic_and_live_readiness() {
+fn an_ordinary_turn_has_no_namedrop_context_or_herdr_work() {
+    let directory = TestDirectory::new();
+    setup(&directory);
+    let herdr = FakeHerdr::new(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let lead = runtime(&directory, &herdr, &ids, "pane-lead");
+
+    for prompt in [
+        "Plan the SSO work.",
+        "Ask @reviewer to inspect this.",
+        "Have a reviewer inspect this.",
+    ] {
+        assert_eq!(
+            hook(prompt, &lead),
+            None,
+            "prompt was not ordinary: {prompt}"
+        );
+    }
+    assert_eq!(herdr.commands(), 0, "ordinary prompts performed Herdr work");
+}
+
+#[test]
+fn legacy_eager_turn_carries_the_workspace_personas_generic_and_live_readiness() {
     let directory = TestDirectory::new();
     setup(&directory);
     let herdr = FakeHerdr::new(&directory);
@@ -288,7 +346,7 @@ fn an_ordinary_turn_carries_the_workspace_personas_generic_and_live_readiness() 
     )
     .unwrap();
 
-    let roster = context(&hook("Plan the SSO work.", &lead).unwrap());
+    let roster = context(&legacy_hook("Plan the SSO work.", &lead).unwrap());
 
     assert!(roster.starts_with(ROSTER_MARKER), "{roster}");
     for expected in [
@@ -372,7 +430,7 @@ fn an_ordinary_turn_carries_the_workspace_personas_generic_and_live_readiness() 
     )
     .unwrap();
     assert!(
-        context(&hook("Plan the SSO work.", &lead).unwrap())
+        context(&legacy_hook("Plan the SSO work.", &lead).unwrap())
             .contains("- @reviewer — \"Reviews Rust changes for risk.\" · delivery disabled"),
         "a disabled agent is still offered as selectable"
     );
@@ -434,43 +492,71 @@ fn mentions_still_route_and_a_delivery_still_authenticates_exactly_as_before() {
         "the authenticated envelope carried a live roster: {envelope}"
     );
 
-    // Claude Code: the attestation leads, the roster follows it.
+    // Claude Code: the attestation and bound commands remain, without a roster.
     let delivered = context(&hook(&envelope.to_string(), &reviewer).unwrap());
     assert!(
         delivered.starts_with(DELIVERY_MARKER),
         "the attestation must lead the delivered context: {delivered}"
     );
+    assert!(delivered.contains(DELIVERY_COMMANDS_MARKER), "{delivered}");
     assert!(
-        delivered.contains(ROSTER_MARKER),
-        "an incoming task did not carry the roster: {delivered}"
+        !delivered.contains(ROSTER_MARKER),
+        "an incoming task carried the roster: {delivered}"
     );
 
-    // Negative, against the positive control above: an envelope that durable
-    // state does not hold is never attested, however well-formed it looks.
+    // An envelope that durable state does not hold gets no context at all.
     let mut forged = envelope.clone();
     forged["control"]["attempt_id"] = json!("delivery-attempt-forged");
-    let forged = hook(&forged.to_string(), &reviewer);
-    assert!(
-        forged
-            .as_ref()
-            .is_none_or(|output| !context(output).contains(DELIVERY_MARKER)),
-        "a forged envelope was attested: {forged:?}"
-    );
-    // The same prompt is also never rerouted as a Mention.
-    assert!(
-        forged
-            .as_ref()
-            .is_none_or(|output| output.get("decision").is_none()),
-        "a forged envelope was routed as a Mention: {forged:?}"
-    );
+    assert_eq!(hook(&forged.to_string(), &reviewer), None);
 }
 
-/// Codex suppresses the attestation whole, so composing the two together would
-/// cost it the roster on every incoming task. It gets the same fresh roster on
-/// its own, the attestation is never produced for it, and both generated
-/// wrappers forward what their own host is actually sent.
 #[test]
-fn an_incoming_task_reaches_both_hosts_with_the_roster_and_only_claude_with_the_attestation() {
+fn kimi_content_part_prompts_route_and_authenticate_like_string_prompts() {
+    let directory = TestDirectory::new();
+    setup(&directory);
+    let herdr = FakeHerdr::new(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let lead = runtime(&directory, &herdr, &ids, "pane-lead");
+    let reviewer = runtime(&directory, &herdr, &ids, "pane-reviewer");
+    register("address-lead", AgentRuntime::KimiCode, &lead);
+    register("address-reviewer", AgentRuntime::KimiCode, &reviewer);
+
+    let routed = execute_user_prompt_submit_hook(
+        &json!({"hook_event_name":"UserPromptSubmit","session_id":"session-lead",
+                "prompt":[{"type":"text","text":"@reviewer Please look at this."}]})
+        .to_string(),
+        &lead,
+    )
+    .unwrap();
+    assert_eq!(routed["decision"], "block");
+    assert_eq!(routed["reason"], "Collaboration message sent.");
+
+    execute_message_operation(
+        "send",
+        json!({"request_id":"req-kimi-content","source":"@reviewer Check the login path.",
+               "author_kind":"agent_session"}),
+        &lead,
+    )
+    .unwrap();
+    let envelope = herdr.envelope_for("pane-reviewer");
+    let delivered = execute_user_prompt_submit_hook(
+        &json!({"hook_event_name":"UserPromptSubmit","session_id":"session-reviewer",
+                "prompt":[{"type":"text","text":envelope.to_string()}]})
+        .to_string(),
+        &reviewer,
+    )
+    .unwrap();
+    let delivered = context(&delivered);
+    assert!(delivered.starts_with(DELIVERY_MARKER), "{delivered}");
+    assert!(delivered.contains(DELIVERY_COMMANDS_MARKER), "{delivered}");
+    assert!(!delivered.contains(ROSTER_MARKER), "{delivered}");
+}
+
+/// Authenticated deliveries keep their bound commands on every host. Only
+/// non-Codex hosts receive the attestation; none receives workspace roster rows.
+#[test]
+fn an_incoming_task_reaches_all_hosts_with_commands_and_only_non_codex_hosts_with_the_attestation()
+{
     let directory = TestDirectory::new();
     setup(&directory);
     let herdr = FakeHerdr::new(&directory);
@@ -498,8 +584,12 @@ fn an_incoming_task_reaches_both_hosts_with_the_roster_and_only_claude_with_the_
     let to_claude = herdr.envelope_for("pane-reviewer").to_string();
     let to_codex = herdr.envelope_for("pane-lead").to_string();
 
+    let claude_discoveries = herdr.worktree_calls();
     let claude_output = hook(&to_claude, &reviewer).unwrap();
+    assert_eq!(herdr.worktree_calls(), claude_discoveries + 1);
+    let codex_discoveries = herdr.worktree_calls();
     let codex_output = hook(&to_codex, &lead).unwrap();
+    assert_eq!(herdr.worktree_calls(), codex_discoveries + 1);
     let claude_context = context(&claude_output);
     let codex_context = context(&codex_output);
 
@@ -507,18 +597,35 @@ fn an_incoming_task_reaches_both_hosts_with_the_roster_and_only_claude_with_the_
         claude_context.starts_with(DELIVERY_MARKER),
         "{claude_context}"
     );
-    assert!(claude_context.contains(ROSTER_MARKER), "{claude_context}");
-    // Codex gets the current roster on its incoming task, and never the
-    // attestation its wrapper would refuse.
     assert!(
-        codex_context.starts_with(ROSTER_MARKER),
-        "Codex did not receive the roster on an incoming task: {codex_context}"
+        claude_context.contains(DELIVERY_COMMANDS_MARKER),
+        "{claude_context}"
+    );
+    assert!(!claude_context.contains(ROSTER_MARKER), "{claude_context}");
+    assert!(
+        codex_context.starts_with("Namedrop workspace roster. Namedrop delivery commands."),
+        "{codex_context}"
+    );
+    assert!(!codex_context.contains("- @lead (you)"), "{codex_context}");
+    assert!(
+        codex_context.contains(DELIVERY_COMMANDS_MARKER),
+        "{codex_context}"
     );
     assert!(
         !codex_context.contains(DELIVERY_MARKER),
         "the attestation was produced for Codex: {codex_context}"
     );
-    assert!(codex_context.contains("- @lead (you)"), "{codex_context}");
+    assert!(!codex_context.contains("- @lead (you)"), "{codex_context}");
+    for context in [&claude_context, &codex_context] {
+        assert!(
+            context.contains("Return requested findings through the bound reply"),
+            "{context}"
+        );
+        assert!(
+            context.contains("do not recruit peers independently"),
+            "{context}"
+        );
+    }
 
     // Both hosts are handed the runnable form of this delivery's own bound
     // operations, with that attempt's ids, beside the prompt.
@@ -593,25 +700,10 @@ fn an_incoming_task_reaches_both_hosts_with_the_roster_and_only_claude_with_the_
         }
     }
 
-    // Each generated wrapper forwards what its own host was actually sent, and
-    // refuses a forged envelope's output, which carries no attestation at all.
+    // An unauthenticated envelope produces no attestation or runnable guidance.
     let mut forged: Value = serde_json::from_str(&to_claude).unwrap();
     forged["control"]["attempt_id"] = json!("delivery-attempt-forged");
-    let forged_context = hook(&forged.to_string(), &reviewer).map(|output| context(&output));
-    assert!(
-        forged_context
-            .as_ref()
-            .is_none_or(|context| !context.contains(DELIVERY_MARKER)),
-        "a forged envelope was attested: {forged_context:?}"
-    );
-    // Guidance is rendered from the reconstruction that authenticated, so an
-    // envelope that authenticates against nothing produces none of it.
-    assert!(
-        forged_context
-            .as_ref()
-            .is_none_or(|context| !context.contains(COMMAND_MARKER)),
-        "a forged envelope was handed runnable commands: {forged_context:?}"
-    );
+    assert_eq!(hook(&forged.to_string(), &reviewer), None);
 
     let executable = directory.root.join("hook-result");
     for (host, package, delivered) in [
@@ -650,6 +742,50 @@ fn an_incoming_task_reaches_both_hosts_with_the_roster_and_only_claude_with_the_
             );
         }
     }
+}
+
+#[test]
+fn a_returned_report_does_not_get_worker_guidance() {
+    let directory = TestDirectory::new();
+    setup(&directory);
+    let herdr = FakeHerdr::new(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let lead = runtime(&directory, &herdr, &ids, "pane-lead");
+    let reviewer = runtime(&directory, &herdr, &ids, "pane-reviewer");
+    register("address-lead", AgentRuntime::Codex, &lead);
+    register("address-reviewer", AgentRuntime::ClaudeCode, &reviewer);
+    let coordination = execute_handoff_operation(
+        "handoff.begin",
+        json!({"request_id":"worker-guidance-coordination", "deliverable":"Review this change."}),
+        &lead,
+    )
+    .unwrap()["coordination_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    execute_message_operation(
+        "send",
+        json!({"request_id":"worker-guidance-request", "source":"@reviewer Review this change.",
+               "author_kind":"agent_session", "coordination_id":coordination}),
+        &lead,
+    )
+    .unwrap();
+    let worker_envelope = herdr.envelope_for("pane-reviewer");
+    let worker_context = context(&hook(&worker_envelope.to_string(), &reviewer).unwrap());
+    assert!(worker_context.contains("Return requested findings through the bound reply"));
+
+    let reply = worker_envelope["control"]["tool"]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["token"] == "reply")
+        .unwrap()["input"]
+        .clone();
+    execute_message_operation("reply", reply, &reviewer).unwrap();
+    let lead_envelope = herdr.envelope_for("pane-lead");
+    let lead_context = context(&hook(&lead_envelope.to_string(), &lead).unwrap());
+    assert!(!lead_context.contains("Return requested findings through the bound reply"));
+    assert!(!lead_context.contains("do not recruit peers independently"));
 }
 
 /// The reader's own row tells it which persona is its default role guidance, so
@@ -691,7 +827,7 @@ fn self_and_its_persona_survive_the_listing_cap_with_the_remaining_count() {
         })
         .unwrap();
 
-    let roster = context(&hook("Plain prompt.", &lead).unwrap());
+    let roster = context(&legacy_hook("Plain prompt.", &lead).unwrap());
 
     assert!(
         roster.contains("- @lead (you) — \"Coordinates this workspace.\" · available now"),
@@ -733,13 +869,13 @@ fn a_paused_space_makes_selection_unavailable_instead_of_offering_idle_peers() {
         &runtime(&directory, &herdr, &ids, "pane-reviewer"),
     );
     assert!(
-        context(&hook("Plain prompt.", &lead).unwrap()).contains("available now"),
+        context(&legacy_hook("Plain prompt.", &lead).unwrap()).contains("available now"),
         "the unpaused control did not offer an available peer"
     );
 
     namedrop::execute_control_operation("worktree.pause", json!({}), &lead).unwrap();
 
-    let paused = context(&hook("Plain prompt.", &lead).unwrap());
+    let paused = context(&legacy_hook("Plain prompt.", &lead).unwrap());
     assert!(
         !paused.contains("available now"),
         "a paused space still labelled a peer available: {paused}"
@@ -780,7 +916,7 @@ fn persona_text_saved_before_the_limits_is_escaped_and_bounded_but_never_rewritt
         )
         .unwrap();
 
-    let roster = context(&hook("Plain prompt.", &lead).unwrap());
+    let roster = context(&legacy_hook("Plain prompt.", &lead).unwrap());
     assert!(
         !roster.contains('\u{1b}'),
         "a control sequence reached the prompt: {roster}"
@@ -830,7 +966,7 @@ fn a_persona_cannot_forge_another_roster_row_or_readiness_field() {
     )
     .unwrap();
 
-    let roster = context(&hook("Plain prompt.", &lead).unwrap());
+    let roster = context(&legacy_hook("Plain prompt.", &lead).unwrap());
 
     // The whole hostile string stays inside one quoted field, and the real
     // readiness still follows it.
@@ -1008,11 +1144,10 @@ fn every_rendered_line_matches_an_installed_codex_prefix_rule() {
     assert!(checked >= 2, "only {checked} lines were checked");
 }
 
-/// A miss keeps the work in this pane, so the turn needs what an ordinary turn
-/// gets: the roster is what says who else could take it. The guidance itself,
-/// and the exact literal emitted when there is no roster, are unchanged.
+/// A miss stays local without model context. The person gets a bounded UI
+/// diagnostic, and an empty hook result passes silently through every wrapper.
 #[test]
-fn a_leading_mention_that_misses_keeps_its_guidance_and_gains_the_roster() {
+fn a_leading_mention_that_misses_is_silent_to_the_model_and_reports_in_ui() {
     let directory = TestDirectory::new();
     setup(&directory);
     let herdr = FakeHerdr::new(&directory);
@@ -1020,60 +1155,54 @@ fn a_leading_mention_that_misses_keeps_its_guidance_and_gains_the_roster() {
     let lead = runtime(&directory, &herdr, &ids, "pane-lead");
     register("address-lead", AgentRuntime::Codex, &lead);
 
-    let missed = hook("@missing please look", &lead).unwrap();
-    let composed = context(&missed);
+    assert_eq!(hook("@missing please look", &lead), None);
+    let events = herdr.ui_events();
+    assert_eq!(events.len(), 2, "missing UI diagnostics: {events:?}");
     assert!(
-        composed.ends_with(MISS_GUIDANCE),
-        "the miss guidance was not preserved verbatim:\n{composed}"
+        events
+            .iter()
+            .all(|event| event.contains("could not be resolved")),
+        "{events:?}"
     );
-    // The wrappers recognize a dynamic context by the marker its serialization
-    // starts with, so the roster has to lead for the guidance to reach the host
-    // at all.
-    assert!(composed.starts_with(ROSTER_MARKER), "{composed}");
-    assert!(composed.contains("- @lead (you)"), "{composed}");
-    assert!(composed.contains("- @reviewer"), "{composed}");
     assert!(
-        missed.get("decision").is_none(),
-        "a miss must stay local: {missed}"
+        events
+            .iter()
+            .any(|event| event.starts_with("namedrop-hook=")),
+        "{events:?}"
     );
+
     // The positive control: a Mention that resolves is still routed and blocked.
     assert_eq!(
         hook("@reviewer please look", &lead).unwrap()["decision"],
         "block"
     );
 
-    // Both installed wrappers forward the composed output as the host runs them.
     let installation = TestDirectory::new();
     let executable = installation.root.join("hook-result");
-    let serialized = missed.to_string();
-    for host in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for host in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let package =
             install_integration_package(&installation.home, host, &executable, &installation.state)
                 .unwrap();
-        fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\nprintf '%s' '{}'\n",
-                serialized.replace('\'', "'\"'\"'")
-            ),
-        )
-        .unwrap();
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let result = Command::new(package.join("scripts/user-prompt-submit"))
             .output()
             .unwrap();
-        assert_eq!(
-            String::from_utf8(result.stdout).unwrap(),
-            serialized,
-            "{host:?} dropped the composed miss guidance"
+        assert!(result.status.success(), "{host:?}");
+        assert!(
+            String::from_utf8(result.stdout).unwrap().is_empty(),
+            "{host:?} emitted context for an empty hook result"
         );
     }
 }
 
-/// With no roster to lead it, the guidance is still the exact known-safe literal
-/// the wrappers match by equality.
+/// Legacy eager mode retains the exact failure literals accepted by old wrappers.
 #[test]
-fn a_miss_with_no_roster_still_emits_the_exact_known_safe_guidance() {
+fn legacy_miss_with_no_roster_still_emits_the_exact_known_safe_guidance() {
     let directory = TestDirectory::new();
     let herdr = FakeHerdr::new(&directory);
     let ids = SequenceIds(AtomicU64::new(1));
@@ -1084,20 +1213,17 @@ fn a_miss_with_no_roster_still_emits_the_exact_known_safe_guidance() {
         .transaction(|transaction| transaction.activate_worktree(&namespace(), &attribution))
         .unwrap();
 
-    // Which of the two applies depends on how far the send got; both are
-    // matched by the wrappers literally, so either must arrive unaccompanied.
-    let guidance = context(&hook("@missing please look", &lead).unwrap());
+    let guidance = context(&legacy_hook("@missing please look", &lead).unwrap());
     assert!(
         [MISS_GUIDANCE, UNCONFIRMED_GUIDANCE].contains(&guidance.as_str()),
         "the guidance is no longer one of the known-safe literals: {guidance:?}"
     );
 }
 
-/// A lone agent is still the reader of its own persona, and a machine where
-/// Namedrop was never set up must not pay for workspace discovery on every
-/// prompt to find that out.
+/// On-demand mode emits nothing even for a lone agent. Legacy eager mode retains
+/// its self-persona row, and missing state still costs no workspace discovery.
 #[test]
-fn a_lone_agent_keeps_its_own_row_and_no_state_asks_herdr_nothing() {
+fn a_lone_agent_has_no_on_demand_context_and_legacy_mode_keeps_its_row() {
     let directory = TestDirectory::new();
     let herdr = FakeHerdr::new(&directory);
     let ids = SequenceIds(AtomicU64::new(1));
@@ -1133,7 +1259,7 @@ fn a_lone_agent_keeps_its_own_row_and_no_state_asks_herdr_nothing() {
     )
     .unwrap();
 
-    let roster = context(&hook("Plain prompt.", &lead).unwrap());
+    let roster = context(&legacy_hook("Plain prompt.", &lead).unwrap());
     assert!(
         roster.contains("- @lead (you) — \"Plans the SSO work.\""),
         "a lone agent was not told its own persona:\n{roster}"
@@ -1152,7 +1278,7 @@ fn address_list_answers_availability_with_the_rosters_own_rule() {
     register("address-lead", AgentRuntime::Codex, &lead);
 
     let listed = execute_lifecycle_operation("address.list", json!({}), &lead).unwrap();
-    let roster = context(&hook("Plain prompt.", &lead).unwrap());
+    let roster = context(&legacy_hook("Plain prompt.", &lead).unwrap());
     let records = listed.as_array().expect("address.list returns an array");
     let record = |alias: &str| {
         records
@@ -1216,7 +1342,7 @@ fn address_list_answers_availability_with_the_rosters_own_rule() {
 }
 
 #[test]
-fn both_installed_wrappers_forward_a_roster_and_only_claude_forwards_the_attestation() {
+fn installed_wrappers_forward_a_roster_and_only_non_codex_hosts_forward_the_attestation() {
     let directory = TestDirectory::new();
     let executable = directory.root.join("hook-result");
     let roster = json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit",

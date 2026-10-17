@@ -117,6 +117,7 @@ else printf '%s\n' '{}'; fi
             .env("HOME", self.0.join("home"))
             .env("CLAUDE_CONFIG_DIR", self.0.join("home").join(".claude"))
             .env("CODEX_HOME", self.0.join("home").join(".codex"))
+            .env("KIMI_CODE_HOME", self.0.join("home").join(".kimi-code"))
             .env_remove("XDG_CONFIG_HOME")
             .env("HERDR_SOCKET_PATH", "test-socket")
             .env("HERDR_WORKSPACE_ID", "popup-workspace")

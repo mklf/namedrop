@@ -25,6 +25,7 @@ State which paths were exercised and which remain unverified. A successful model
 ## Features
 
 - [Names and personas](names.md) covers terminal naming, rename, persona preservation/clearing, and naming/management popups.
+- [On-demand directory and zero prompt context](directory.md) covers exact/self/group resolution, candidate pagination, read-only guarantees, and empty ordinary hook output.
 - [Groups](groups.md) covers creation, list, membership, removal, and group mentions.
 - [Collaboration controls and Doctor](controls.md) covers workspace pause/resume and health, with address/thread controls as separate drives.
 - [Shared checkout](shared-checkout.md) covers a second workspace opened on a checkout that another workspace already has open, on the repository root and on a linked worktree, with Doctor, activation, separate names in each workspace, and refusal of a caller that names no workspace.

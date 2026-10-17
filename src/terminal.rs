@@ -160,6 +160,21 @@ pub(crate) fn shell_is_available(herdr: &impl HerdrCommandExecutor, pane_id: &st
         .is_some_and(|p| p.shell_pid > 0 && p.shell_pid == p.foreground_process_group_id)
 }
 
+pub(crate) fn shell_availability(
+    herdr: &impl HerdrCommandExecutor,
+    addresses: &[crate::PaneAddressRecord],
+) -> std::collections::BTreeMap<String, bool> {
+    let mut availability = std::collections::BTreeMap::new();
+    for address in addresses {
+        if address.pane_type == crate::PaneType::Terminal
+            && let Some(pane_id) = address.pane_id.as_ref()
+        {
+            availability.insert(pane_id.clone(), shell_is_available(herdr, pane_id));
+        }
+    }
+    availability
+}
+
 fn process_info(herdr: &impl HerdrCommandExecutor, pane_id: &str) -> Option<ProcessInfo> {
     herdr
         .execute(&["pane", "process-info", "--pane", pane_id])
@@ -216,8 +231,8 @@ pub fn verify_inherited_pane(
         return Ok(());
     }
     let sessions = if agent_session_ids.is_empty() {
-        "There is no CODEX_SESSION_ID or CLAUDE_CODE_SESSION_ID in the environment to vouch \
-         for it."
+        "There is no CODEX_SESSION_ID, CLAUDE_CODE_SESSION_ID, or NAMEDROP_AGENT_SESSION_ID in \
+         the environment to vouch for it."
             .to_owned()
     } else {
         format!(

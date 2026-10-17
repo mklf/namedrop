@@ -71,10 +71,12 @@ print(abi if abi >= 0 else "unavailable (" + os.strerror(ctypes.get_errno()) + "
   *) landlock='not checked (unsupported architecture)' ;;
 esac
 row "landlock abi" "${landlock:-not checked}"
-case "$landlock" in
-  [1-9]|[1-9][0-9]) ;;
-  *) missing="$missing landlock-abi>=1" ;;
-esac
+if command -v codex >/dev/null 2>&1; then
+  case "$landlock" in
+    [1-9]|[1-9][0-9]) ;;
+    *) missing="$missing landlock-abi>=1" ;;
+  esac
+fi
 
 row "login shell" "${SHELL:-unset}"
 probe optional bash bash --version
@@ -88,8 +90,12 @@ if command -v python3 >/dev/null 2>&1 && ! at_least "$(python3 --version 2>&1)" 
   missing="$missing python3>=3.9"
 fi
 probe required git git --version
-probe required codex codex --version
-probe required claude claude --version
+probe optional codex codex --version
+probe optional claude claude --version
+probe optional kimi kimi --version
+if ! command -v codex >/dev/null 2>&1 && ! command -v claude >/dev/null 2>&1 && ! command -v kimi >/dev/null 2>&1; then
+  missing="$missing supported-agent"
+fi
 probe optional namedrop namedrop --version
 # Linux Codex helpers execute only a static native Codex binary: the command
 # itself, or the musl binary inside the official @openai/codex npm layout.
@@ -136,6 +142,7 @@ present() { if [ -e "$1" ]; then printf present; else printf absent; fi; }
 set_or_unset() { if [ -n "$1" ]; then printf set; else printf unset; fi; }
 row "codex sign-in file" "$(present "${CODEX_HOME:-$HOME/.codex}/auth.json") (presence only; keyring sign-ins show absent)"
 row "claude sign-in file" "$(present "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json") (presence only)"
+row "kimi sign-in directory" "$(present "${KIMI_CODE_HOME:-$HOME/.kimi-code}/credentials") (presence only)"
 row "api key variables" "OPENAI_API_KEY $(set_or_unset "${OPENAI_API_KEY-}"), ANTHROPIC_API_KEY $(set_or_unset "${ANTHROPIC_API_KEY-}")"
 
 if [ -n "$missing" ]; then

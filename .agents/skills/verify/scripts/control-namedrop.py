@@ -67,7 +67,7 @@ def read_envelopes(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--feature", choices=["names", "groups", "controls", "tour", "handoffs", "shared-checkout", "stuck-wake",
+    parser.add_argument("--feature", choices=["names", "directory", "groups", "controls", "tour", "handoffs", "shared-checkout", "stuck-wake",
                                               "idle-worker", "stale-runtime"], default="names")
     parser.add_argument("--binary", type=Path, default=REPO / "target/debug/namedrop")
     args = parser.parse_args()
@@ -109,9 +109,9 @@ def main():
         with (evidence / "commands.jsonl").open("a") as log:
             log.write(json.dumps(row) + "\n")
 
-    def command(*argv, check=True, context=None, timeout=30, kind="host", cwd=None):
+    def command(*argv, check=True, context=None, timeout=30, kind="host", cwd=None, stdin=None):
         result = subprocess.run([str(a) for a in argv], env=dict(env, **(context or {})), cwd=cwd or base / "workspace",
-                                capture_output=True, text=True, timeout=timeout)
+                                input=stdin, capture_output=True, text=True, timeout=timeout)
         record({"kind": kind, "argv": [str(a) for a in argv], "exit": result.returncode,
                 "stdout": result.stdout, "stderr": result.stderr})
         if check and result.returncode:
@@ -239,6 +239,40 @@ def main():
             assert refused["error"]["message"] == "a named terminal cannot hold a persona", refused
             roster = cli("address", "list", "--json")["data"]
             assert next(a for a in roster if a["alias"] == "verify-build")["persona"] is None, roster
+        elif args.feature == "directory":
+            cli("name", "@lead", "--type", "agent", "--persona", "Coordinates work.")
+            cli("name", "@reviewer", "--type", "agent", "--persona", "Reviews Rust changes.", pane=panes["worker"])
+            body("group", "set", alias="review-team", members=["lead", "reviewer"])
+            before = database_snapshot()
+            resolved = body("address", "resolve", aliases=["reviewer", "review-team", "missing"],
+                            include_persona=True)
+            results = {result["query"]: result for result in resolved["results"]}
+            assert results["reviewer"]["status"] == "found", results
+            assert results["reviewer"]["persona"] == "Reviews Rust changes.", results
+            assert results["missing"]["status"] == "unknown", results
+            assert results["review-team"]["type"] == "group", results
+            assert results["review-team"]["group_fingerprint"].startswith("v1:"), results
+            own = body("address", "resolve", **{"self": True})
+            assert own["results"][0]["alias"] == "lead" and own["results"][0]["self"] is True, own
+
+            first = body("address", "candidates", pane_type="agent", availability="all",
+                         include_self=True, limit=1)
+            assert first["total"] == 2 and len(first["candidates"]) == 1 and first["has_more"] is True, first
+            second = body("address", "candidates", pane_type="agent", availability="all",
+                          include_self=True, limit=1, cursor=first["next_cursor"])
+            assert second["total"] == 2 and len(second["candidates"]) == 1, second
+            assert second["has_more"] is False and second["next_cursor"] is None, second
+            assert first["candidates"][0]["id"] != second["candidates"][0]["id"], (first, second)
+
+            ordinary = command(binary, "hook", "user-prompt-submit", "--state-directory", state,
+                               context={"HERDR_WORKSPACE_ID": spaces["lead"], "HERDR_PANE_ID": panes["lead"]},
+                               stdin=json.dumps({"hook_event_name": "UserPromptSubmit",
+                                                 "prompt": "Ask @reviewer to inspect this."}))
+            assert ordinary.returncode == 0 and ordinary.stdout == "" and ordinary.stderr == "", ordinary
+            assert before == database_snapshot(), "Directory reads or an ordinary hook changed stored state"
+            save("directory.json", {"resolve": resolved, "self": own, "first": first, "second": second,
+                                    "ordinary_hook": {"exit": ordinary.returncode, "stdout": ordinary.stdout,
+                                                      "stderr": ordinary.stderr}})
         elif args.feature == "groups":
             cli("name", "@reviewer", "--type", "agent", "--persona", "Reviews Rust changes.")
             cli("name", "@tester", "--type", "agent", "--generic", pane=panes["worker"])
@@ -840,19 +874,33 @@ def main():
 
         def owned_processes():
             found = []
-            for entry in Path("/proc").iterdir():
-                if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            if Path("/proc").is_dir():
+                for entry in Path("/proc").iterdir():
+                    if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                        continue
+                    try:
+                        exe = os.readlink(entry / "exe")
+                    except OSError:
+                        exe = ""
+                    try:
+                        argv = (entry / "cmdline").read_bytes().decode(errors="replace").split("\0")
+                    except OSError:
+                        continue
+                    if str(base) in exe or any(str(base) in argument for argument in argv):
+                        found.append({"pid": int(entry.name), "exe": exe, "argv": [a for a in argv if a]})
+                return found
+            listing = subprocess.run(["ps", "-eo", "pid=,comm=,args="], capture_output=True,
+                                     text=True, check=True).stdout
+            for line in listing.splitlines()[1:]:
+                fields = line.strip().split(None, 2)
+                if len(fields) != 3:
                     continue
-                try:
-                    exe = os.readlink(entry / "exe")
-                except OSError:
-                    exe = ""
-                try:
-                    argv = (entry / "cmdline").read_bytes().decode(errors="replace").split("\0")
-                except OSError:
+                pid, exe, args = fields
+                if int(pid) == os.getpid():
                     continue
+                argv = shlex.split(args)
                 if str(base) in exe or any(str(base) in argument for argument in argv):
-                    found.append({"pid": int(entry.name), "exe": exe, "argv": [a for a in argv if a]})
+                    found.append({"pid": int(pid), "exe": exe, "argv": argv})
             return found
 
         remaining = list((base / "run").glob("*.sock"))

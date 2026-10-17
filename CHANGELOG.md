@@ -2,6 +2,18 @@
 
 Each release is a section here, newest first. The GitHub release for a version uses its section as the release notes. See [releasing](docs/releasing.md) for how versions are chosen.
 
+## [1.1.0] - 2026-10-16
+
+### Added
+
+- Kimi Code joins Codex and Claude Code as a supported collaboration host. Activation installs its skill, native `UserPromptSubmit` integration, and scoped command permissions in `$KIMI_CODE_HOME`; naming, mentions, replies, personas, groups, tracked handoffs, shared context, Doctor, and live updates use the existing `collab/v1` state without a migration.
+- Kimi Code's Agent status panel shows observed facts and recent output. Model-generated status summaries and persona suggestions are not available for Kimi Code in this release.
+- On-demand directory reads: `address.resolve` resolves exact aliases or self and returns full targeted personas plus complete recipient-expansion fingerprints, while `address.candidates` returns bounded, typed collaborator pages with live readiness and stable unfiltered cursors. Optional `recipient_expectations` guard sends and previews against lookup-to-send identity, live session, binding, group changes, and automatic-selection capacity.
+
+### Changed
+
+- Ordinary user prompts no longer inject the workspace roster, selection policy, fallback guidance, or self persona. Embedded mentions and role-based collaboration use the installed skill for on-demand discovery; column-zero mentions keep deterministic routing, and authenticated deliveries retain only their exact-session controls. Failed leading handoffs now use Herdr UI diagnostics without model context.
+
 ## [1.0.2] - 2026-10-12
 
 ### Changed

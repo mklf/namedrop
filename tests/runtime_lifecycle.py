@@ -20,7 +20,7 @@ def main():
     subprocess.run([actual, '--validate-update-manifest', REPO / 'herdr-plugin.toml'], check=True)
     with tempfile.TemporaryDirectory(prefix='namedrop runtime ') as directory:
         base = Path(directory)
-        os.environ.update(HOME=str(base/'home'), CLAUDE_CONFIG_DIR=str(base/'home/.claude'), CODEX_HOME=str(base/'home/.codex'))
+        os.environ.update(HOME=str(base/'home'), CLAUDE_CONFIG_DIR=str(base/'home/.claude'), CODEX_HOME=str(base/'home/.codex'), KIMI_CODE_HOME=str(base/'home/.kimi-code'))
         invalid = base / 'invalid.toml'
         invalid.write_text((REPO / 'herdr-plugin.toml').read_text().replace(
             '"sh", "./scripts/run.sh", "reconcile"', '"./bin/namedrop", "reconcile"'))

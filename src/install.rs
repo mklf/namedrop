@@ -15,8 +15,10 @@ use toml_edit::{DocumentMut, Item};
 
 mod claude_permissions;
 mod command;
+mod kimi_config;
 pub(crate) use claude_permissions::remove_claude_permissions;
 pub(crate) use command::install_shell_command;
+pub(crate) use kimi_config::remove_kimi_configuration;
 
 /// The marker that records this plugin's ownership and installed version of one
 /// package directory. A pre-existing target without it belongs to somebody else.
@@ -53,6 +55,7 @@ const CODEX_SNAPSHOT_FILES: [&str; 5] = [
 pub struct AgentConfigDirectories<'a> {
     pub claude: Option<&'a Path>,
     pub codex: Option<&'a Path>,
+    pub kimi: Option<&'a Path>,
 }
 impl AgentConfigDirectories<'_> {
     fn claude(self, home: &Path) -> PathBuf {
@@ -64,6 +67,11 @@ impl AgentConfigDirectories<'_> {
         self.codex
             .map(Path::to_owned)
             .unwrap_or_else(|| home.join(".codex"))
+    }
+    fn kimi(self, home: &Path) -> PathBuf {
+        self.kimi
+            .map(Path::to_owned)
+            .unwrap_or_else(|| home.join(".kimi-code"))
     }
 }
 
@@ -81,6 +89,7 @@ fn package_components(runtime: AgentRuntime) -> [&'static str; 3] {
     match runtime {
         AgentRuntime::Codex => [".agents", "skills", "namedrop"],
         AgentRuntime::ClaudeCode => [".claude", "skills", "namedrop"],
+        AgentRuntime::KimiCode => [".kimi-code", "skills", "namedrop"],
     }
 }
 
@@ -91,15 +100,38 @@ pub fn package_directory(root: &Path, runtime: AgentRuntime) -> PathBuf {
         .fold(root.to_path_buf(), |path, component| path.join(component))
 }
 
-/// The two shared user-level package directories, in the order the activation
+pub(crate) fn package_directory_with_config(
+    root: &Path,
+    runtime: AgentRuntime,
+    config: AgentConfigDirectories<'_>,
+) -> PathBuf {
+    match runtime {
+        AgentRuntime::KimiCode => config.kimi(root).join("skills/namedrop"),
+        AgentRuntime::Codex | AgentRuntime::ClaudeCode => package_directory(root, runtime),
+    }
+}
+
+/// The shared user-level package directories, in the order the activation
 /// confirmation discloses them.
-fn user_package_directories(home_directory: &Path) -> [(AgentRuntime, PathBuf); 2] {
-    [AgentRuntime::Codex, AgentRuntime::ClaudeCode]
-        .map(|runtime| (runtime, package_directory(home_directory, runtime)))
+fn user_package_directories(
+    home_directory: &Path,
+    config: AgentConfigDirectories<'_>,
+) -> [(AgentRuntime, PathBuf); 3] {
+    [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ]
+    .map(|runtime| {
+        (
+            runtime,
+            package_directory_with_config(home_directory, runtime, config),
+        )
+    })
 }
 
 /// The disclosure the first Worktree activation must show before anything is
-/// written, naming both shared user-level targets.
+/// written, naming the shared user-level targets.
 pub fn disclosed_user_package_targets(
     home_directory: Option<&Path>,
     config: AgentConfigDirectories<'_>,
@@ -107,7 +139,7 @@ pub fn disclosed_user_package_targets(
     let Some(home_directory) = home_directory else {
         return "unavailable: no user home directory resolved".to_owned();
     };
-    let packages = user_package_directories(home_directory)
+    let packages = user_package_directories(home_directory, config)
         .iter()
         .map(|(runtime, directory)| format!("{}: {}", runtime.as_str(), directory.display()))
         .collect::<Vec<_>>()
@@ -115,10 +147,13 @@ pub fn disclosed_user_package_targets(
     let codex_home = config.codex(home_directory);
     let claude_settings = claude_permissions::settings_path(&config.claude(home_directory))
         .unwrap_or_else(|_| home_directory.join(".claude/settings.json"));
+    let kimi_config = kimi_config::config_path(&config.kimi(home_directory))
+        .unwrap_or_else(|_| home_directory.join(".kimi-code/config.toml"));
     format!(
-        "{packages}, Claude collaboration permissions: {}, Codex collaboration permissions: {}, shell command: {}, PATH entries in zsh/bash startup files",
+        "{packages}, Claude collaboration permissions: {}, Codex collaboration permissions: {}, Kimi hooks and collaboration permissions: {}, shell command: {}, PATH entries in zsh/bash startup files",
         claude_settings.display(),
         codex_home.join("rules/namedrop.rules").display(),
+        kimi_config.display(),
         home_directory.join(".local/bin/namedrop").display()
     )
 }
@@ -171,6 +206,10 @@ pub(crate) fn user_hook_activation_guidance(
         "claude-code": {
             "status": "loads_next_session",
             "steps": ["Start a new Claude Code session or run /reload-plugins. Verify a request and reply; doctor alone cannot verify hooks."]
+        },
+        "kimi-code": {
+            "status": "loads_next_session",
+            "steps": ["Start a new Kimi Code session or run /reload. Verify a request and reply; doctor alone cannot verify hooks."]
         }
     })
 }
@@ -179,12 +218,13 @@ pub(crate) fn native_session_setup(runtime: AgentRuntime) -> Value {
     let host_runtime = match runtime {
         AgentRuntime::Codex => "codex",
         AgentRuntime::ClaudeCode => "claude",
+        AgentRuntime::KimiCode => "kimi",
     };
     let explanation = match runtime {
         AgentRuntime::Codex => {
             "Herdr has not reported a native agent session identity. A fresh Codex can show its composer before running SessionStart; submit your first prompt in that pane, then check registration. Mentions stay queued until the real session is registered. If identity is still missing after a turn, install/update the Herdr native integration, restart Codex and approve its native hooks if requested."
         }
-        AgentRuntime::ClaudeCode => {
+        AgentRuntime::ClaudeCode | AgentRuntime::KimiCode => {
             "Herdr has not reported a native agent session identity. For a new setup, install the Herdr native integration, then restart the agent and approve its native hooks if requested."
         }
     };
@@ -359,6 +399,9 @@ fn install_integration_package_with_config(
             .map_err(|error| conflict(&path, &format!("cannot create rules directory: {error}")))?;
         replace_if_changed(&path, &contents, Some(0o600))?;
     }
+    if runtime == AgentRuntime::KimiCode {
+        kimi_config::refresh(&config.kimi(root), &directory, executable, state_directory)?;
+    }
     if runtime == AgentRuntime::ClaudeCode
         && let Err(error) =
             claude_permissions::refresh(&config.claude(root), executable, state_directory)
@@ -403,7 +446,7 @@ fn prepare_integration_package(
     if runtime == AgentRuntime::ClaudeCode {
         validate_claude_permission_paths(executable, state_directory)?;
     }
-    let directory = verified_package_directory(root, runtime)?;
+    let directory = verified_package_directory(root, runtime, config)?;
     let package = integration_package(runtime);
     let instructions =
         installed_instructions(package.instructions, runtime, executable, state_directory)?;
@@ -457,6 +500,9 @@ pub(crate) fn inspect_integration_package(
     }
     if let Some((path, contents)) = prepared.codex_policy {
         inspect_installed_file(&path, &contents, Some(0o600))?;
+    }
+    if runtime == AgentRuntime::KimiCode {
+        kimi_config::inspect(&config.kimi(home), &prepared.directory, &executable, state)?;
     }
     if runtime == AgentRuntime::ClaudeCode {
         claude_permissions::inspect(&config.claude(home), &executable, state)?;
@@ -616,17 +662,21 @@ fn installed_instructions(
     let body = format!(
         "{body}\n## Invocation\n\nUse the installed executable directly with `--plugin-state <HERDR_PLUGIN_STATE_DIR>` before the bound operation. Append `--herdr-socket`, `--herdr-workspace`, and `--herdr-pane` with the exact `control.tool.environment` values. Keep operation tokens and flags as shown; single-quote literal values. For long JSON, write and verify a file in a separate tool call, then use `--input-json-file <absolute-path>` instead of `--input-json`; retain all bound fields. Use no environment prefix, shell substitution, pipes or wrappers. An OS sandbox access error is not an approval decision: request normal host approval for this exact invocation. If approval policy rejects it, report the blocker and keep the reply pending; do not broaden permissions or relay around the denial.\n"
     );
-    if runtime != AgentRuntime::ClaudeCode {
-        return Ok(format!(
-            "{frontmatter}\n---\n{body}\nCodex: request elevated execution when required because Namedrop writes outside the workspace. Scoped installer rules load in the next session.\n"
-        ));
-    }
-    Ok(format!(
-        "{frontmatter}\n---\n{body}\nClaude Code: Activation installs scoped collaboration permissions in settings.json. Loading this skill grants no permissions.\n"
-    ))
+    let host_guidance = match runtime {
+        AgentRuntime::Codex => {
+            "Codex: request elevated execution when required because Namedrop writes outside the workspace. Scoped installer rules load in the next session."
+        }
+        AgentRuntime::ClaudeCode => {
+            "Claude Code: Activation installs scoped collaboration permissions in settings.json. Loading this skill grants no permissions."
+        }
+        AgentRuntime::KimiCode => {
+            "Kimi Code: Activation installs the UserPromptSubmit hook and scoped collaboration permissions in config.toml. Start a new session or run /reload; loading this skill grants no permissions or hooks."
+        }
+    };
+    Ok(format!("{frontmatter}\n---\n{body}\n{host_guidance}\n"))
 }
 
-/// The outcome of refreshing both shared user-level packages for one lifecycle
+/// The outcome of refreshing the shared user-level packages for one lifecycle
 /// event. A runtime whose package failed must not be challenged.
 pub(crate) struct IntegrationPackageInstallation {
     outcomes: Vec<(AgentRuntime, Result<PathBuf, String>)>,
@@ -647,23 +697,44 @@ impl IntegrationPackageInstallation {
     ) -> Value {
         let mut report = serde_json::Map::new();
         for (runtime, outcome) in &self.outcomes {
-            let permissions = if *runtime == AgentRuntime::ClaudeCode {
-                let inspection = home_directory
-                    .ok_or_else(|| "no user home directory is available".to_owned())
-                    .and_then(|home| {
-                        let executable = PathBuf::from(crate::collaboration_executable()?);
-                        claude_permissions::inspect(&config.claude(home), &executable, state)
-                    });
-                Some(
-                    json!({"current": inspection.is_ok(), "repair": if inspection.is_ok() { "Re-run activation." } else { claude_permissions::REPAIR_GUIDANCE }, "error": inspection.err()}),
-                )
-            } else {
-                None
+            let permissions = match runtime {
+                AgentRuntime::ClaudeCode => {
+                    let inspection = home_directory
+                        .ok_or_else(|| "no user home directory is available".to_owned())
+                        .and_then(|home| {
+                            let executable = PathBuf::from(crate::collaboration_executable()?);
+                            claude_permissions::inspect(&config.claude(home), &executable, state)
+                        });
+                    Some(
+                        json!({"current": inspection.is_ok(), "repair": if inspection.is_ok() { "Re-run activation." } else { claude_permissions::REPAIR_GUIDANCE }, "error": inspection.err()}),
+                    )
+                }
+                AgentRuntime::KimiCode => {
+                    let inspection = home_directory
+                        .ok_or_else(|| "no user home directory is available".to_owned())
+                        .and_then(|home| {
+                            let executable = PathBuf::from(crate::collaboration_executable()?);
+                            kimi_config::inspect(
+                                &config.kimi(home),
+                                &package_directory_with_config(
+                                    home,
+                                    AgentRuntime::KimiCode,
+                                    config,
+                                ),
+                                &executable,
+                                state,
+                            )
+                        });
+                    Some(
+                        json!({"current": inspection.is_ok(), "repair": if inspection.is_ok() { "Re-run activation." } else { kimi_config::REPAIR_GUIDANCE }, "error": inspection.err()}),
+                    )
+                }
+                AgentRuntime::Codex => None,
             };
             report.insert(runtime.as_str().to_owned(), json!({
                 "permissions": permissions,
                 "installed": outcome.is_ok(),
-                "path": home_directory.map(|home| package_directory(home, *runtime)),
+                "path": home_directory.map(|home| package_directory_with_config(home, *runtime, config)),
                 "error": outcome.as_ref().err(),
                 "hook_verification": "unverified",
                 "configuration": if outcome.is_err() { "installation_failed" } else if *runtime == AgentRuntime::Codex {
@@ -693,7 +764,7 @@ impl IntegrationPackageInstallation {
     }
 }
 
-/// Refreshes both shared user-level Agent Integration packages before any
+/// Refreshes the shared user-level Agent Integration packages before any
 /// registration challenge is issued. A failed package does not fail the
 /// lifecycle event: it blocks challenge issuance for that runtime and leaves one
 /// durable Integration Registration Attention Item naming the failed target. A
@@ -709,10 +780,15 @@ where
 {
     let (_package_guard, current) = crate::installed_runtime::package_guard()?;
     let executable = crate::collaboration_executable().map(PathBuf::from);
-    let outcomes = [AgentRuntime::Codex, AgentRuntime::ClaudeCode].map(|agent_runtime| {
+    let outcomes = [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ]
+    .map(|agent_runtime| {
         let outcome = match (runtime.home_directory, &executable) {
             (Some(home_directory), _) if !current => {
-                verified_package_directory(home_directory, agent_runtime)
+                verified_package_directory(home_directory, agent_runtime, runtime.agent_config)
             }
             (Some(home_directory), Ok(executable)) => install_integration_package_with_config(
                 home_directory,
@@ -910,38 +986,70 @@ fn hook_script(
             state_directory.display()
         )
     })?;
-    let mut safe_context = crate::hook::failed_handoff_hook_outputs()
+    let format = match runtime {
+        AgentRuntime::KimiCode => crate::HookOutputFormat::Kimi,
+        AgentRuntime::Codex | AgentRuntime::ClaudeCode => crate::HookOutputFormat::Legacy,
+    };
+    let format_flag = match format {
+        crate::HookOutputFormat::Kimi => " --format kimi",
+        crate::HookOutputFormat::Legacy => "",
+    };
+    let mut legacy_context = crate::hook::failed_handoff_hook_outputs_for_format(format)
         .iter()
         .map(|output| {
             format!(
-                "if [ \"$output\" = {} ]; then\n  printf '%s' \"$output\"\nfi\n",
+                "if [ \"$output\" = {} ]; then\n  printf '%s' \"$output\"\n  exit 0\nfi\n",
                 shell_single_quote(&output.to_string())
             )
         })
         .collect::<String>();
-    // The workspace persona roster is plugin-authored but changes every turn, so
-    // it cannot be an exact literal. The wrapper recognizes it by the serialized
-    // text either side of its fixed marker, which no other output carries. The
-    // delivery attestation stays Claude-only under the same rule.
-    let mut markers = vec![crate::persona::ROSTER_MARKER];
-    if runtime == AgentRuntime::ClaudeCode {
-        markers.push(crate::hook::DELIVERY_MARKER);
-    }
+    // The roster marker is accepted for legacy eager output and Codex's
+    // delivery-only compatibility prefix; delivery commands have their own marker.
+    let (opening, closing) =
+        crate::hook::context_bounds_for_format(crate::persona::ROSTER_MARKER, format);
+    legacy_context.push_str(&format!(
+        "case \"$output\" in\n  {}*{}) printf '%s' \"$output\"; exit 0 ;;\nesac\n",
+        shell_single_quote(&opening),
+        shell_single_quote(&closing),
+    ));
+    let mut delivery_context = String::new();
+    let markers = if runtime == AgentRuntime::Codex {
+        vec![
+            crate::hook::DELIVERY_COMMANDS_MARKER,
+            crate::hook::CODEX_DELIVERY_COMPATIBILITY_MARKER,
+        ]
+    } else {
+        vec![
+            crate::hook::DELIVERY_COMMANDS_MARKER,
+            crate::hook::DELIVERY_MARKER,
+        ]
+    };
     for marker in markers {
-        let (opening, closing) = crate::hook::context_bounds(marker);
-        safe_context.push_str(&format!(
-            "case \"$output\" in\n  {}*{}) printf '%s' \"$output\" ;;\nesac\n",
+        let (opening, closing) = crate::hook::context_bounds_for_format(marker, format);
+        delivery_context.push_str(&format!(
+            "case \"$output\" in\n  {}*{}) printf '%s' \"$output\"; exit 0 ;;\nesac\n",
             shell_single_quote(&opening),
             shell_single_quote(&closing),
         ));
     }
+    let block = crate::format_user_prompt_submit_hook_output(
+        serde_json::json!({"decision":"block","reason":"Collaboration message sent."}),
+        format,
+    )
+    .expect("the handoff result has a host representation")
+    .to_string();
     Ok(format!(
-        "#!/bin/sh\noutput=$({} hook user-prompt-submit --state-directory {} 2>/dev/null) || exit 0\nif [ \"$output\" = '{{\"decision\":\"block\",\"reason\":\"Collaboration message sent.\"}}' ]; then\n  {} hook mailbox-wake --state-directory {} </dev/null >/dev/null 2>&1 &\n  printf '%s' \"$output\"\n  exit 0\nfi\n{}exit 0\n",
+        "#!/bin/sh\nif {} hook user-prompt-submit --help 2>/dev/null | grep -q -- '--context-mode'; then\n  context_mode_args=' --context-mode on-demand-v1'\n  allow_legacy=0\nelse\n  context_mode_args=''\n  allow_legacy=1\nfi\noutput=$({} hook user-prompt-submit --state-directory {}{}{} 2>/dev/null) || exit 0\nif [ \"$output\" = {} ]; then\n  {} hook mailbox-wake --state-directory {} </dev/null >/dev/null 2>&1 &\n  printf '%s' \"$output\"\n  exit 0\nfi\nif [ \"$allow_legacy\" = 1 ]; then\n{}fi\n{}exit 0\n",
+        shell_single_quote(executable),
         shell_single_quote(executable),
         shell_single_quote(state_directory),
+        format_flag,
+        "$context_mode_args",
+        shell_single_quote(&block),
         shell_single_quote(executable),
         shell_single_quote(state_directory),
-        safe_context,
+        legacy_context,
+        delivery_context,
     ))
 }
 
@@ -986,7 +1094,11 @@ fn verify_owned_plugin_targets(
 
 /// Refuses every unowned target before anything is written, so a conflict never
 /// follows or modifies what it found.
-fn verified_package_directory(root: &Path, runtime: AgentRuntime) -> Result<PathBuf, String> {
+fn verified_package_directory(
+    root: &Path,
+    runtime: AgentRuntime,
+    config: AgentConfigDirectories<'_>,
+) -> Result<PathBuf, String> {
     if !root.is_absolute() {
         return Err(format!(
             "the {} Agent Integration package requires an absolute installation root, not {}",
@@ -994,8 +1106,21 @@ fn verified_package_directory(root: &Path, runtime: AgentRuntime) -> Result<Path
             root.display()
         ));
     }
-    let mut path = root.to_path_buf();
-    for component in package_components(runtime) {
+    let components = package_components(runtime);
+    let (base, components) = match runtime {
+        AgentRuntime::KimiCode => {
+            let base = config.kimi(root);
+            if !base.is_absolute() {
+                return Err(
+                    "KIMI_CODE_HOME must be absolute to install the Kimi package".to_owned(),
+                );
+            }
+            (base, &components[1..])
+        }
+        AgentRuntime::Codex | AgentRuntime::ClaudeCode => (root.to_path_buf(), &components[..]),
+    };
+    let mut path = base;
+    for component in components {
         path.push(component);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_symlink() => {
@@ -1009,7 +1134,7 @@ fn verified_package_directory(root: &Path, runtime: AgentRuntime) -> Result<Path
             Err(error) => return Err(conflict(&path, &format!("cannot be inspected: {error}"))),
         }
     }
-    let directory = package_directory(root, runtime);
+    let directory = package_directory_with_config(root, runtime, config);
     if fs::symlink_metadata(&directory).is_ok() {
         verify_ownership(&directory)?;
     }
@@ -1178,6 +1303,8 @@ mod permission_tests {
             "Bash('/opt/namedrop' --plugin-state '/opt/state' handoff resolve *)",
             "Bash('/opt/namedrop' --plugin-state '/opt/state' handoff adopt *)",
             "Bash('/opt/namedrop' --plugin-state '/opt/state' address list *)",
+            "Bash('/opt/namedrop' --plugin-state '/opt/state' address resolve *)",
+            "Bash('/opt/namedrop' --plugin-state '/opt/state' address candidates *)",
         ];
         assert_eq!(actual, expected);
         for operation in crate::operation_catalog()

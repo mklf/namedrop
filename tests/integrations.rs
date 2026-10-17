@@ -12,8 +12,8 @@ use namedrop::{
     ResultSetCompletion, ResultSetOutcome, ResultSetStatus, StateNamespace, StateStore,
     TRUSTED_DELIVERY_INSTRUCTION, ThreadId, complete_capability_profile,
     execute_integration_operation, execute_lifecycle_operation, execute_message_operation,
-    install_integration_package, integration_package, issue_registration_challenge,
-    operation_catalog, package_directory,
+    format_user_prompt_submit_hook_output, install_integration_package, integration_package,
+    issue_registration_challenge, operation_catalog, package_directory,
 };
 use std::{
     fs,
@@ -477,13 +477,17 @@ impl HerdrCommandExecutor for ProductionHerdr {
             .to_string(),
             ["agent", "prompt", "pane-agent", prompt] => {
                 if let Some(home_directory) = self.probed_home.lock().unwrap().as_ref() {
-                    let primed = [AgentRuntime::Codex, AgentRuntime::ClaudeCode]
-                        .into_iter()
-                        .all(|runtime| {
-                            package_directory(home_directory, runtime)
-                                .join("SKILL.md")
-                                .is_file()
-                        });
+                    let primed = [
+                        AgentRuntime::Codex,
+                        AgentRuntime::ClaudeCode,
+                        AgentRuntime::KimiCode,
+                    ]
+                    .into_iter()
+                    .all(|runtime| {
+                        package_directory(home_directory, runtime)
+                            .join("SKILL.md")
+                            .is_file()
+                    });
                     self.primed_at_prompt.lock().unwrap().push(primed);
                 }
                 self.prompts.lock().unwrap().push((*prompt).to_owned());
@@ -722,7 +726,7 @@ fn production_onboarding_challenges_registers_and_drains_queued_work() {
     );
     assert_eq!(
         execute_integration_operation("delivery.inbox", serde_json::json!({}), &base).unwrap(),
-        serde_json::json!({"envelopes": []})
+        serde_json::json!({"envelopes": [], "agent_runtime": "codex", "worker_attempts": []})
     );
 }
 
@@ -1221,6 +1225,89 @@ fn production_onboarding_recognizes_claude_code_sessions() {
 }
 
 #[test]
+fn production_onboarding_recognizes_kimi_code_sessions() {
+    let directory = TestDirectory::new();
+    let herdr = ProductionHerdr::default();
+    *herdr.agent.lock().unwrap() = "kimi".to_owned();
+    let ids = SequenceIds(AtomicU64::new(1));
+    let runtime = LifecycleRuntime {
+        state_directory: directory.path(),
+        home_directory: Some(directory.home()),
+        agent_config: namedrop::AgentConfigDirectories::default(),
+        cwd: Path::new("/repo"),
+        workspace_id: None,
+        current_pane_id: Some("pane-agent"),
+        session_socket_id: "socket-a",
+        herdr: &herdr,
+        clock: &FixedClock,
+        ids: &ids,
+    };
+    let activated =
+        execute_lifecycle_operation("activate", serde_json::json!({"confirmed": true}), &runtime)
+            .unwrap();
+    assert_eq!(
+        activated["agent_integration_hook_activation"]["kimi-code"]["status"],
+        "loads_next_session"
+    );
+    execute_lifecycle_operation(
+        "address.create",
+        serde_json::json!({"preset": "implementer", "alias": "recipient"}),
+        &runtime,
+    )
+    .unwrap();
+    let prompt = herdr.prompts.lock().unwrap()[0].clone();
+    let input = registration_input_from_prompt(&prompt);
+    let (instructions, command) = prompt.split_once("then stop this turn: ").unwrap();
+    assert!(
+        !instructions.to_ascii_lowercase().contains("skill"),
+        "Kimi registration must run directly without skill loading: {prompt}"
+    );
+    assert!(
+        !instructions.contains("elevated"),
+        "Kimi registration must not request Codex elevation: {prompt}"
+    );
+    assert!(
+        prompt.contains("do not run `describe`, `--help`, or any other preliminary shell command"),
+        "{prompt}"
+    );
+
+    let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let prefix = format!(
+        "'{}' --plugin-state '{}' register",
+        executable.display(),
+        directory.path().display()
+    );
+    assert!(
+        command.starts_with(&prefix),
+        "registration must use a fixed executable/state prefix: {command}"
+    );
+    for flag in [
+        "--herdr-socket 'socket-a'",
+        "--herdr-workspace 'workspace-1'",
+        "--herdr-pane 'pane-agent'",
+    ] {
+        assert!(
+            command.contains(flag),
+            "registration omits {flag}: {command}"
+        );
+    }
+    let config = fs::read_to_string(directory.home().join(".kimi-code/config.toml")).unwrap();
+    let document = config.parse::<toml_edit::DocumentMut>().unwrap();
+    let rules = document["permission"]["rules"]
+        .as_array_of_tables()
+        .unwrap();
+    let expected_rule = format!("Bash({prefix} *{{,/**/*}})");
+    assert!(
+        rules.iter().any(|rule| {
+            rule.get("pattern").and_then(toml_edit::Item::as_str) == Some(expected_rule.as_str())
+        }),
+        "challenge has no managed permission: {command}"
+    );
+    assert!(config.contains("event = \"UserPromptSubmit\""));
+    assert_eq!(input["runtime"], "kimi-code");
+}
+
+#[test]
 fn generated_skill_command_forms_are_covered_by_managed_settings() {
     let directory = TestDirectory::new();
     let executable = directory.path().join("runtime with spaces/namedrop");
@@ -1252,7 +1339,7 @@ fn generated_skill_command_forms_are_covered_by_managed_settings() {
         serde_json::from_value(settings["permissions"]["allow"].clone()).unwrap();
     assert_eq!(
         permissions.len(),
-        18,
+        20,
         "registration uses the same fixed prefix as the other operations"
     );
     for rule in &permissions {
@@ -1474,9 +1561,13 @@ fn codex_plugin_version_tracks_generated_hook_content() {
 
 #[test]
 fn packaged_skill_descriptions_exclude_self_sufficient_delivery_envelopes() {
-    const EXPECTED: &str = "Name and @mention agents or terminals in Herdr; manage groups, inspect handoffs, preview sends, recover deliveries, and share context.";
+    const EXPECTED: &str = "Resolve named Herdr agents and coordinate through Namedrop. Use for embedded agent mentions, requests involving another agent, and useful permitted delegation. Delivery envelopes are self-contained.";
 
-    for runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let descriptions = integration_package(runtime)
             .instructions
             .split_once("\n---\n")
@@ -1497,7 +1588,11 @@ fn packaged_skill_descriptions_exclude_self_sufficient_delivery_envelopes() {
 
 #[test]
 fn packaged_skill_profiles_stay_compact_and_defer_delivery_discovery() {
-    for runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let instructions = integration_package(runtime).instructions;
         // A tripwire, not a target: the packaged profile is loaded into every
         // session. The permissions section adds the persistent Claude settings
@@ -1524,6 +1619,8 @@ fn packaged_skill_profiles_stay_compact_and_defer_delivery_discovery() {
                 runtime.as_str()
             );
         }
+        assert!(instructions.contains("Do not run it before `describe` itself"));
+        assert!(instructions.contains("`name`, `activate`, `deactivate`, `doctor`"));
     }
 }
 
@@ -1532,7 +1629,11 @@ fn packaged_skill_profiles_stay_compact_and_defer_delivery_discovery() {
 /// declining a context request, so an agent never has to guess the shapes.
 #[test]
 fn packaged_skills_and_reply_examples_document_the_context_handoff_surfaces() {
-    for runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let package = integration_package(runtime);
         for surface in [
             "`context` block to `send` or `reply`",
@@ -1584,7 +1685,11 @@ fn packaged_skills_and_reply_examples_document_the_context_handoff_surfaces() {
 
 #[test]
 fn every_context_schema_accepts_the_same_checkout_selector() {
-    for runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let catalog: OperationCatalog =
             serde_json::from_str(integration_package(runtime).tool_descriptor).unwrap();
         let schema = |token: &str| &catalog.operation(token).unwrap().input_schema;
@@ -1616,7 +1721,11 @@ fn every_context_schema_accepts_the_same_checkout_selector() {
 
 #[test]
 fn packaged_skills_route_doctor_requests_without_authorizing_repairs() {
-    for runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let instructions = integration_package(runtime).instructions;
         assert!(instructions.contains("## Health checks"));
         assert!(instructions.contains("run `doctor` with the installed prefix above and no input"));
@@ -1634,7 +1743,11 @@ fn packaged_skills_route_doctor_requests_without_authorizing_repairs() {
 #[test]
 fn codex_and_claude_code_packages_expose_the_same_complete_profile() {
     let mut shared_catalog = None;
-    for runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let package = integration_package(runtime);
         let catalog: OperationCatalog = serde_json::from_str(package.tool_descriptor).unwrap();
 
@@ -1718,7 +1831,11 @@ fn codex_and_claude_code_packages_expose_the_same_complete_profile() {
 
 #[test]
 fn shared_registration_conformance_binds_a_nonce_to_the_exact_agent_session() {
-    for agent_runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for agent_runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let directory = TestDirectory::new();
         setup_registered_address(&directory);
         let ids = SequenceIds(AtomicU64::new(1));
@@ -2085,7 +2202,11 @@ fn the_trusted_instruction_prioritizes_the_final_human_answer() {
 
 #[test]
 fn both_runtime_skills_reserve_final_synthesis_for_the_result_set() {
-    for runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let instructions = integration_package(runtime).instructions;
         for required in [
             "in priority order",
@@ -2366,7 +2487,7 @@ fn describe_suggests_a_hyphenated_token_without_accepting_the_misspelling() {
 }
 
 #[test]
-fn roster_management_descriptor_binds_runnable_cli_without_expanding_registration() {
+fn directory_management_descriptors_bind_runnable_cli_without_expanding_registration() {
     use clap::Parser;
     let description = namedrop::describe_operations(Some("address.list")).unwrap();
     let described = &description["operations"][0];
@@ -2385,7 +2506,10 @@ fn roster_management_descriptor_binds_runnable_cli_without_expanding_registratio
     for management in &operation_catalog().management_operations {
         assert_eq!(
             management.automatic_permission,
-            management.token == "address.list"
+            matches!(
+                management.token.as_str(),
+                "address.list" | "address.resolve" | "address.candidates"
+            )
         );
     }
 
@@ -2410,6 +2534,32 @@ fn roster_management_descriptor_binds_runnable_cli_without_expanding_registratio
     let cli = namedrop::cli::Cli::try_parse_from(args).unwrap();
     assert_eq!(cli.operation(), "address.list");
     assert_eq!(cli.input().unwrap(), serde_json::json!({}));
+
+    for token in ["address.resolve", "address.candidates"] {
+        let description = namedrop::describe_operations(Some(token)).unwrap();
+        let operation = &description["operations"][0];
+        if token == "address.resolve" {
+            assert!(
+                operation["input_schema"]["properties"]["include_persona"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("1000 characters")
+            );
+        }
+        let input = operation["examples"][0]["input"].to_string();
+        let mut args = vec!["namedrop"];
+        args.extend(
+            operation["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap()),
+        );
+        args.extend(["--input-json", input.as_str()]);
+        let cli = namedrop::cli::Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.operation(), token);
+        assert_eq!(cli.input().unwrap(), operation["examples"][0]["input"]);
+    }
 }
 
 /// Every advertised capability, not only the delivered subset, must reach a
@@ -2836,37 +2986,41 @@ fn installed_names(directory: &Path) -> Vec<String> {
 /// lifecycle event that rewrote an unchanged package would be visible.
 fn package_fingerprint(home_directory: &Path) -> Vec<(String, u64, u64, std::time::SystemTime)> {
     use std::os::unix::fs::MetadataExt;
-    [AgentRuntime::Codex, AgentRuntime::ClaudeCode]
-        .into_iter()
-        .flat_map(|runtime| {
-            let directory = package_directory(home_directory, runtime);
-            let mut pending = vec![directory];
-            let mut files = Vec::new();
-            while let Some(directory) = pending.pop() {
-                for entry in fs::read_dir(directory).unwrap() {
-                    let path = entry.unwrap().path();
-                    if path.is_dir() {
-                        pending.push(path);
-                    } else {
-                        files.push(path);
-                    }
+    [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ]
+    .into_iter()
+    .flat_map(|runtime| {
+        let directory = package_directory(home_directory, runtime);
+        let mut pending = vec![directory];
+        let mut files = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.push(path);
                 }
             }
-            files.sort();
-            files
-                .into_iter()
-                .map(|path| {
-                    let metadata = fs::metadata(&path).unwrap();
-                    (
-                        path.display().to_string(),
-                        metadata.ino(),
-                        metadata.len(),
-                        metadata.modified().unwrap(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+        }
+        files.sort();
+        files
+            .into_iter()
+            .map(|path| {
+                let metadata = fs::metadata(&path).unwrap();
+                (
+                    path.display().to_string(),
+                    metadata.ino(),
+                    metadata.len(),
+                    metadata.modified().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .collect()
 }
 
 fn file_fingerprint(path: &Path) -> (String, u64, std::time::SystemTime) {
@@ -2918,7 +3072,11 @@ fn activation_installs_both_shared_packages_before_challenging_either_runtime() 
     assert_installed_package(directory.home(), AgentRuntime::Codex);
     assert_installed_package(directory.home(), AgentRuntime::ClaudeCode);
     let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-    for agent_runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for agent_runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let script = fs::read_to_string(
             package_directory(directory.home(), agent_runtime).join("scripts/user-prompt-submit"),
         )
@@ -2935,7 +3093,7 @@ fn activation_installs_both_shared_packages_before_challenging_either_runtime() 
             .unwrap();
     assert_eq!(
         settings["permissions"]["allow"].as_array().unwrap().len(),
-        18
+        20
     );
 
     execute_lifecycle_operation(
@@ -3064,7 +3222,7 @@ fn a_previous_version_package_is_replaced_without_touching_unrelated_files() {
     assert_eq!(settings["unrelated"], true);
     assert_eq!(
         settings["permissions"]["allow"].as_array().unwrap().len(),
-        18
+        20
     );
     assert_eq!(installed_names(&skill_root), ["namedrop", "other-skill"]);
 }
@@ -3447,6 +3605,130 @@ fn only_the_claude_hook_wrapper_forwards_authenticated_delivery_context() {
 }
 
 #[test]
+fn all_installed_hook_wrappers_forward_delivery_command_context() {
+    let directory = TestDirectory::new();
+    let executable = directory.path().join("hook-result");
+    for agent_runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
+        let format = if agent_runtime == AgentRuntime::KimiCode {
+            namedrop::HookOutputFormat::Kimi
+        } else {
+            namedrop::HookOutputFormat::Legacy
+        };
+        let output = format_user_prompt_submit_hook_output(
+            serde_json::json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit",
+                "additionalContext":"Namedrop delivery commands.\n\nNamedrop commands: bound operations"}}),
+            format,
+        )
+        .unwrap()
+        .to_string();
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s' '{}'\n",
+                output.replace('\'', "'\"'\"'")
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let package = install_integration_package(
+            directory.home(),
+            agent_runtime,
+            &executable,
+            directory.path(),
+        )
+        .unwrap();
+        let result = Command::new(package.join("scripts/user-prompt-submit"))
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{agent_runtime:?}: {result:?}");
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap(),
+            output,
+            "{agent_runtime:?} dropped delivery commands"
+        );
+    }
+}
+
+#[test]
+fn zero_mode_wrappers_reject_legacy_roster_output() {
+    let directory = TestDirectory::new();
+    let executable = directory.path().join("hook-result");
+    for agent_runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
+        let format = if agent_runtime == AgentRuntime::KimiCode {
+            namedrop::HookOutputFormat::Kimi
+        } else {
+            namedrop::HookOutputFormat::Legacy
+        };
+        let output = |context: &str| {
+            format_user_prompt_submit_hook_output(
+                serde_json::json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit",
+                    "additionalContext":context}}),
+                format,
+            )
+            .unwrap()
+            .to_string()
+        };
+        let install = |context: &str| {
+            let output = output(context);
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\ncase \"$*\" in\n  *--help*) printf '%s' '--context-mode' ;;\n  *) printf '%s' '{}' ;;\nesac\n",
+                    output.replace('\'', "'\"'\"'")
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            install_integration_package(
+                directory.home(),
+                agent_runtime,
+                &executable,
+                directory.path(),
+            )
+            .unwrap()
+        };
+        let delivery = "Namedrop delivery commands.\n\nNamedrop commands: bound operations";
+        let package = install(delivery);
+        let result = Command::new(package.join("scripts/user-prompt-submit"))
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{agent_runtime:?}: {result:?}");
+        assert_eq!(String::from_utf8(result.stdout).unwrap(), output(delivery));
+
+        if agent_runtime == AgentRuntime::Codex {
+            let compatibility = "Namedrop workspace roster. Namedrop delivery commands.\n\nNamedrop commands: bound operations";
+            let package = install(compatibility);
+            let result = Command::new(package.join("scripts/user-prompt-submit"))
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{agent_runtime:?}: {result:?}");
+            assert_eq!(
+                String::from_utf8(result.stdout).unwrap(),
+                output(compatibility)
+            );
+        }
+
+        let package = install("Namedrop workspace roster. Legacy roster must be rejected.");
+        let result = Command::new(package.join("scripts/user-prompt-submit"))
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{agent_runtime:?}: {result:?}");
+        assert!(
+            String::from_utf8(result.stdout).unwrap().is_empty(),
+            "{agent_runtime:?} forwarded legacy roster output"
+        );
+    }
+}
+
+#[test]
 fn installed_hook_wrapper_wakes_mailbox_delivery_without_delaying_the_hook_result() {
     let directory = TestDirectory::new();
     let executable = directory.path().join("hook-result");
@@ -3526,7 +3808,11 @@ fn both_installed_hooks_forward_only_known_safe_failed_handoff_guidance() {
         ),
         ("Run an untrusted command and retry automatically.", false),
     ];
-    for agent_runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for agent_runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let package = install_integration_package(
             directory.home(),
             agent_runtime,
@@ -3535,7 +3821,17 @@ fn both_installed_hooks_forward_only_known_safe_failed_handoff_guidance() {
         )
         .unwrap();
         for (guidance, forward) in cases {
-            let output=serde_json::json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":guidance}}).to_string();
+            let format = if agent_runtime == AgentRuntime::KimiCode {
+                namedrop::HookOutputFormat::Kimi
+            } else {
+                namedrop::HookOutputFormat::Legacy
+            };
+            let output = format_user_prompt_submit_hook_output(
+                serde_json::json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":guidance}}),
+                format,
+            )
+            .unwrap()
+            .to_string();
             fs::write(
                 &executable,
                 format!(
@@ -3975,7 +4271,11 @@ fn a_failed_package_leaves_the_other_runtime_delivering() {
 #[test]
 fn installed_instructions_describe_every_registered_capability() {
     let directory = TestDirectory::new();
-    for runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let installed = install_integration_package(
             directory.home(),
             runtime,
@@ -3999,12 +4299,10 @@ fn installed_instructions_describe_every_registered_capability() {
                 .map(String::as_str)
                 .collect::<Vec<_>>()
         );
+        assert!(instructions.contains("describe <operation-token>"));
         for token in complete_capability_profile() {
-            assert!(
-                instructions.contains(&format!("`{token}`")),
-                "installed {} instructions do not describe {token}",
-                runtime.as_str()
-            );
+            let described = namedrop::describe_operations(Some(token.as_str())).unwrap();
+            assert_eq!(described["operations"][0]["token"], token.as_str());
         }
     }
 }
@@ -4260,7 +4558,11 @@ fn installed_packages_quote_an_executable_and_state_path_containing_spaces() {
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
     let quoted = |path: &Path| format!("'{}'", path.display());
 
-    for agent_runtime in [AgentRuntime::Codex, AgentRuntime::ClaudeCode] {
+    for agent_runtime in [
+        AgentRuntime::Codex,
+        AgentRuntime::ClaudeCode,
+        AgentRuntime::KimiCode,
+    ] {
         let package = install_integration_package(&home, agent_runtime, &executable, &state)
             .unwrap_or_else(|error| panic!("{agent_runtime:?}: {error}"));
         assert!(package.starts_with(&home), "{package:?}");
@@ -4273,6 +4575,18 @@ fn installed_packages_quote_an_executable_and_state_path_containing_spaces() {
         }
         let wrapper = fs::read_to_string(package.join("scripts/user-prompt-submit")).unwrap();
         assert!(wrapper.contains(&quoted(&state)), "{wrapper}");
+        let format = if agent_runtime == AgentRuntime::KimiCode {
+            namedrop::HookOutputFormat::Kimi
+        } else {
+            namedrop::HookOutputFormat::Legacy
+        };
+        let block = format_user_prompt_submit_hook_output(
+            serde_json::json!({"decision":"block","reason":"Collaboration message sent."}),
+            format,
+        )
+        .unwrap()
+        .to_string();
+        fs::write(&executable, format!("#!/bin/sh\nprintf '%s' '{block}'\n")).unwrap();
         // Executing the generated wrapper proves the quoting resolves, rather
         // than only that the path text appears in it.
         let hook = Command::new(package.join("scripts/user-prompt-submit"))

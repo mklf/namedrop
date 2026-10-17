@@ -956,6 +956,289 @@ fn preview_shows_expanded_live_recipients_and_redacted_context_without_mutation(
 }
 
 #[test]
+fn group_fingerprint_excludes_the_author_for_a_guarded_preview() {
+    let directory = TestDirectory::new();
+    setup(&directory);
+    let herdr = FakeHerdr::new(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let source = runtime(&directory, &herdr, &ids, "pane-source");
+    register("address-source", &source);
+    namedrop::execute_group_operation(
+        "group.set",
+        serde_json::json!({"alias":"team", "members":["source", "reviewer"]}),
+        &source,
+    )
+    .unwrap();
+    let resolved = namedrop::execute_directory_operation(
+        "address.resolve",
+        serde_json::json!({"aliases":["team"]}),
+        &source,
+    )
+    .unwrap();
+    assert_eq!(
+        resolved["results"][0]["members"].as_array().unwrap().len(),
+        2
+    );
+
+    let preview = execute_handoff_operation(
+        "handoff.preview",
+        serde_json::json!({
+            "source":"@team Inspect this.",
+            "recipient_expectations": {
+                "group_fingerprint": resolved["results"][0]["group_fingerprint"].clone()
+            }
+        }),
+        &source,
+    )
+    .unwrap();
+
+    assert_eq!(preview["recipients"].as_array().unwrap().len(), 1);
+    assert_eq!(preview["recipients"][0]["alias"], "reviewer");
+}
+
+#[test]
+fn mixed_recipient_expansion_fingerprint_covers_the_complete_request() {
+    let directory = TestDirectory::new();
+    setup(&directory);
+    let herdr = FakeHerdr::new(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let source = runtime(&directory, &herdr, &ids, "pane-source");
+    register("address-source", &source);
+    namedrop::execute_group_operation(
+        "group.set",
+        serde_json::json!({"alias":"team", "members":["source", "reviewer"]}),
+        &source,
+    )
+    .unwrap();
+    let resolved = namedrop::execute_directory_operation(
+        "address.resolve",
+        serde_json::json!({"aliases":["team", "researcher"]}),
+        &source,
+    )
+    .unwrap();
+    assert_ne!(
+        resolved["recipient_expansion_fingerprint"],
+        resolved["results"][0]["group_fingerprint"]
+    );
+
+    let preview = execute_handoff_operation(
+        "handoff.preview",
+        serde_json::json!({
+            "source":"@team @researcher Inspect this.",
+            "recipient_expectations": {
+                "group_fingerprint": resolved["recipient_expansion_fingerprint"].clone()
+            }
+        }),
+        &source,
+    )
+    .unwrap();
+
+    let aliases = preview["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|recipient| recipient["alias"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(aliases, ["reviewer", "researcher"]);
+}
+
+#[test]
+fn directory_resolution_guards_binding_and_session() {
+    let directory = TestDirectory::new();
+    setup(&directory);
+    let herdr = FakeHerdr::new(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let source = runtime(&directory, &herdr, &ids, "pane-source");
+    register("address-source", &source);
+    let resolved = namedrop::execute_directory_operation(
+        "address.resolve",
+        serde_json::json!({"aliases":["reviewer"]}),
+        &source,
+    )
+    .unwrap();
+    let expected = &resolved["results"][0];
+    let input = serde_json::json!({
+        "source":"@reviewer Inspect this.",
+        "recipient_expectations": {
+            "recipients": [{
+                "address_id": expected["id"],
+                "pane_binding_id": expected["pane_binding_id"],
+                "agent_session_id": expected["agent_session_id"]
+            }]
+        }
+    });
+    execute_handoff_operation("handoff.preview", input.clone(), &source).unwrap();
+
+    let mut stale = input;
+    stale["recipient_expectations"]["recipients"][0]["agent_session_id"] =
+        serde_json::json!("session-changed");
+    assert!(
+        execute_handoff_operation("handoff.preview", stale, &source)
+            .unwrap_err()
+            .starts_with("recipient_changed:")
+    );
+}
+
+#[test]
+fn guarded_session_expectation_must_match_live_discovery() {
+    let directory = TestDirectory::new();
+    setup(&directory);
+    let herdr = FakeHerdr::new(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let source = runtime(&directory, &herdr, &ids, "pane-source");
+    register("address-source", &source);
+    let resolved = namedrop::execute_directory_operation(
+        "address.resolve",
+        serde_json::json!({"aliases":["reviewer"]}),
+        &source,
+    )
+    .unwrap();
+    let expected = &resolved["results"][0];
+    let input = serde_json::json!({
+        "request_id":"live-session-guard",
+        "source":"@reviewer Inspect this.",
+        "recipient_expectations": {
+            "recipients": [{
+                "address_id": expected["id"],
+                "pane_binding_id": expected["pane_binding_id"],
+                "agent_session_id": expected["agent_session_id"]
+            }]
+        }
+    });
+    let before = fs::read(directory.state.join("namedrop.sqlite3")).unwrap();
+    *herdr.live_pane_override.lock().unwrap() = Some((
+        "pane-reviewer".to_owned(),
+        Some("session-replacement".to_owned()),
+    ));
+
+    let mut preview_input = input.clone();
+    preview_input.as_object_mut().unwrap().remove("request_id");
+    let preview_error =
+        execute_handoff_operation("handoff.preview", preview_input, &source).unwrap_err();
+    assert!(
+        preview_error.starts_with("recipient_changed:"),
+        "{preview_error}"
+    );
+    let send_error = execute_message_operation("send", input, &source).unwrap_err();
+    assert!(send_error.starts_with("recipient_changed:"), "{send_error}");
+    assert_eq!(
+        fs::read(directory.state.join("namedrop.sqlite3")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn terminal_dispatch_eligibility_observes_shell_availability() {
+    let directory = TestDirectory::new();
+    setup(&directory);
+    let herdr = FakeHerdr::new(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let source = runtime(&directory, &herdr, &ids, "pane-source");
+    register("address-source", &source);
+    *herdr.terminal.lock().unwrap() = true;
+    *herdr.shell_ready.lock().unwrap() = false;
+    let terminal = runtime(&directory, &herdr, &ids, "pane-reviewer");
+    namedrop::execute_lifecycle_operation(
+        "name",
+        serde_json::json!({"alias":"build", "pane_type":"terminal"}),
+        &terminal,
+    )
+    .unwrap();
+
+    let busy = namedrop::execute_directory_operation(
+        "address.candidates",
+        serde_json::json!({"pane_type":"terminal", "availability":"all"}),
+        &source,
+    )
+    .unwrap();
+    assert_eq!(busy["candidates"].as_array().unwrap().len(), 1, "{busy}");
+    assert!(
+        busy["candidates"][0]["readiness"]["constraints"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("shell_busy_or_unknown"))
+    );
+    let eligible = namedrop::execute_directory_operation(
+        "address.candidates",
+        serde_json::json!({"pane_type":"terminal", "availability":"dispatch_eligible"}),
+        &source,
+    )
+    .unwrap();
+    assert_eq!(eligible["candidates"].as_array().unwrap().len(), 0);
+
+    *herdr.shell_ready.lock().unwrap() = true;
+    let eligible = namedrop::execute_directory_operation(
+        "address.candidates",
+        serde_json::json!({"pane_type":"terminal", "availability":"dispatch_eligible"}),
+        &source,
+    )
+    .unwrap();
+    assert_eq!(eligible["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(eligible["candidates"][0]["alias"], "build");
+
+    *herdr.shell_ready.lock().unwrap() = false;
+    let sent = execute_message_operation(
+        "send",
+        serde_json::json!({"request_id":"terminal-status", "source":"@build printf 'hello'"}),
+        &source,
+    )
+    .unwrap();
+    let status =
+        execute_handoff_operation("handoff.status", serde_json::json!({}), &source).unwrap();
+    assert!(
+        status["handoffs"][0]["recipients"][0]["outlook"]["constraints"].is_array(),
+        "{status}"
+    );
+    assert!(
+        status["handoffs"][0]["recipients"][0]["outlook"]["constraints"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("shell_busy_or_unknown"))
+    );
+    let results = execute_handoff_operation(
+        "handoff.results",
+        serde_json::json!({"message_id": sent["message_id"]}),
+        &source,
+    )
+    .unwrap();
+    assert!(
+        results["recipients"][0]["outlook"]["constraints"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("shell_busy_or_unknown"))
+    );
+}
+
+#[test]
+fn preview_rejects_stale_recipient_expectations_without_mutation() {
+    let directory = TestDirectory::new();
+    setup(&directory);
+    let herdr = FakeHerdr::new(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let source = runtime(&directory, &herdr, &ids, "pane-source");
+    register("address-source", &source);
+    let before = fs::read(directory.state.join("namedrop.sqlite3")).unwrap();
+
+    let error = execute_handoff_operation(
+        "handoff.preview",
+        serde_json::json!({
+            "source":"@reviewer Inspect this.",
+            "recipient_expectations": {
+                "recipients": [{"address_id":"address-researcher"}]
+            }
+        }),
+        &source,
+    )
+    .unwrap_err();
+
+    assert!(error.starts_with("recipient_changed:"), "{error}");
+    assert_eq!(
+        fs::read(directory.state.join("namedrop.sqlite3")).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn returned_reviews_report_fresh_stale_and_unknown_against_the_captured_files() {
     let directory = TestDirectory::new();
     init_git_repo(&directory);
@@ -1440,44 +1723,13 @@ fn text_that_addresses_nobody_is_left_untouched_by_the_hook() {
         "@-dash-leads hello",
         " @reviewer indented past column zero",
     ] {
-        // The prompt is not rerouted: no block decision and no handoff
-        // guidance. An ordinary turn may still carry the persona roster, which
-        // is context about the space rather than anything done to the prompt.
-        let output = hook(prompt);
-        assert!(
-            output.as_ref().is_none_or(|output| {
-                output.get("decision").is_none()
-                    && output
-                        .pointer("/hookSpecificOutput/additionalContext")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|context| context.starts_with("Namedrop workspace roster."))
-            }),
-            "{prompt:?} addresses nobody, so the hook must not route it: {output:?}"
-        );
+        assert_eq!(hook(prompt), None, "{prompt:?} addresses nobody");
     }
-    // A Mention with no body addresses someone, so the send is still attempted
-    // and its failure still reported. Silencing it would hide a real handoff
-    // failure, so this case is deliberately outside the guard above.
-    assert!(
-        hook("@reviewer").is_some(),
-        "a Mention with no body still reports its handoff failure"
-    );
-    // An alias-shaped Mention that does not resolve is indistinguishable from a
-    // mistyped name, so it still earns the "check the name" guidance. That is
-    // the documented miss behavior, and it shows the silence above is a grammar
-    // decision rather than a disabled hook.
+    // A Mention with no body still attempts the send. Its failure is reported
+    // only through the human UI path, never as model context.
+    assert_eq!(hook("@reviewer"), None);
     for prompt in ["@missing please look", "@property is a decorator"] {
-        assert_eq!(
-            hook(prompt)
-                .unwrap()
-                .pointer("/hookSpecificOutput/additionalContext")
-                .and_then(serde_json::Value::as_str)
-                .map(|context| {
-                    context.contains("could not resolve at least one leading recipient")
-                }),
-            Some(true),
-            "{prompt:?}"
-        );
+        assert_eq!(hook(prompt), None, "{prompt:?}");
     }
     assert_eq!(
         hook("@reviewer please look").unwrap()["decision"],
@@ -2119,6 +2371,7 @@ fn cli_exposes_all_features_and_keeps_management_out_of_delivery_permissions() {
             .env("HOME", &directory.home)
             .env("CLAUDE_CONFIG_DIR", directory.home.join(".claude"))
             .env("CODEX_HOME", directory.home.join(".codex"))
+            .env("KIMI_CODE_HOME", directory.home.join(".kimi-code"))
             .env_remove("XDG_CONFIG_HOME")
             .env("HERDR_BIN_PATH", &mock)
             .arg("--plugin-state")

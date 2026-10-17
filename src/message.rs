@@ -197,6 +197,8 @@ struct SendInput {
     #[serde(default = "human_actor")]
     author_kind: ActorKind,
     context: Option<MessageContextInput>,
+    #[serde(default)]
+    recipient_expectations: Option<crate::RecipientExpectations>,
     #[serde(flatten)]
     tracking: crate::coordination::TrackingInput,
 }
@@ -236,6 +238,7 @@ struct MessageOperationInput {
     context: Option<MessageContextInput>,
     request_context: bool,
     decline_context_request: Option<ContextGrantId>,
+    recipient_expectations: Option<crate::RecipientExpectations>,
     tracking: crate::coordination::TrackingInput,
 }
 
@@ -249,6 +252,7 @@ struct PreparedMessageOperation {
     context: Option<MessageContextInput>,
     request_context: bool,
     decline_context_request: Option<ContextGrantId>,
+    recipient_expectations: Option<crate::RecipientExpectations>,
     tracking: crate::coordination::TrackingInput,
     grammar_version: &'static str,
 }
@@ -325,6 +329,7 @@ where
         context: None,
         request_context: false,
         decline_context_request: None,
+        recipient_expectations: input.recipient_expectations,
         tracking: input.tracking,
         grammar_version: "mention-hook/v1",
     };
@@ -350,9 +355,13 @@ where
         context,
         request_context,
         decline_context_request,
+        recipient_expectations,
         grammar_version,
         tracking,
     } = input;
+    let recipient_expectations = recipient_expectations
+        .map(normalize_recipient_expectations)
+        .transpose()?;
     if context.is_some() && author_kind != ActorKind::AgentSession {
         return Err(
             "a context block requires an agent-authored message (author_kind agent_session)"
@@ -387,6 +396,10 @@ where
     };
     let namespace = discovered.namespace(runtime.session_socket_id);
     let mut store = StateStore::open(runtime.state_directory).map_err(|error| error.to_string())?;
+    let addresses = store
+        .transaction(|transaction| transaction.list_pane_addresses(&namespace))
+        .map_err(|error| error.to_string())?;
+    let shell_availability = crate::terminal::shell_availability(runtime.herdr, &addresses);
     // Validation, redaction, and the optional git pin all happen before the
     // routing transaction: a send that fails from here on delivers nothing and
     // leaves at most one orphaned pin ref for the lazy sweep.
@@ -450,13 +463,16 @@ where
             },
             runtime.clock.now_unix_ms(),
         );
-        if let Some(replay) = transaction.replay_message(
+        if let Some(replay) = transaction.replay_message_with_expectations(
             &namespace,
             &author.address_id,
             &request_id,
-            &authored_source,
-            in_reply_to.as_ref(),
-            author_kind,
+            crate::ReplayMessageInput {
+                authored_source: &authored_source,
+                in_reply_to: in_reply_to.as_ref(),
+                author_kind,
+                recipient_expectations: recipient_expectations.as_ref(),
+            },
         )? {
             if !transaction.coordination_links(&namespace,&replay.receipt.message_id)?.is_empty() {
                 crate::context::registered_current_address(transaction,&namespace,pane_id,&discovered)?;
@@ -514,6 +530,24 @@ where
             &parsed.recipient_aliases,
             &author.address_id,
         )?;
+        if let Some(expectations) = recipient_expectations.as_ref() {
+            let addresses = transaction.list_pane_addresses(&namespace)?;
+            validate_resolved_recipient_expectations(
+                expectations,
+                &recipients,
+                &addresses,
+                &discovered,
+            )
+            .map_err(crate::StoreError::invalid_input)?;
+            validate_recipient_capacity(
+                expectations,
+                &recipients,
+                transaction,
+                &namespace,
+                &discovered,
+                &shell_availability,
+            )?;
+        }
         if (in_reply_to.is_some() || context.is_some()) && recipients.iter().any(|r|
             transaction.pane_type(&namespace,&r.address_id).is_ok_and(|kind|kind==crate::PaneType::Terminal)) {
             return Err(crate::StoreError::invalid_input("terminal recipients accept new shell command requests without agent context attachments"));
@@ -613,7 +647,12 @@ where
                 &attribution,
             )?;
         }
-        let receipt = transaction.append_message(&namespace, &draft, &attribution)?;
+        let receipt = transaction.append_message_with_expectations(
+            &namespace,
+            &draft,
+            &attribution,
+            recipient_expectations.as_ref(),
+        )?;
         crate::coordination::track_message(transaction, &namespace, &draft, &tracking, disposition_attempt_id.as_ref(), &discovered, runtime)?;
         if let Some(attempt_id) = &disposition_attempt_id {
             transaction.record_reply_disposition(
@@ -923,6 +962,7 @@ fn prepare_source_message(
         context: input.context,
         request_context: input.request_context,
         decline_context_request: input.decline_context_request,
+        recipient_expectations: input.recipient_expectations,
         tracking: input.tracking,
         grammar_version: "mention/v1",
     })
@@ -943,6 +983,7 @@ fn parse_operation_input(operation: &str, input: Value) -> Result<MessageOperati
                 context: input.context,
                 request_context: false,
                 decline_context_request: None,
+                recipient_expectations: input.recipient_expectations,
                 tracking: input.tracking,
             })
         }
@@ -969,6 +1010,7 @@ fn parse_operation_input(operation: &str, input: Value) -> Result<MessageOperati
                     .transpose()?,
                 context: input.context,
                 request_context: input.request_context,
+                recipient_expectations: None,
                 tracking: input.tracking,
                 decline_context_request: input
                     .decline_context_request
@@ -989,6 +1031,131 @@ fn message_author_kind(author_kind: ActorKind) -> Result<ActorKind, String> {
     } else {
         Err("message author_kind must be human or agent_session".to_owned())
     }
+}
+
+pub(crate) fn normalize_recipient_expectations(
+    mut expectations: crate::RecipientExpectations,
+) -> Result<crate::RecipientExpectations, String> {
+    if expectations.recipients.is_empty() && expectations.group_fingerprint.is_none() {
+        return Err("recipient_expectations requires recipients or group_fingerprint".to_owned());
+    }
+    if expectations.recipients.len() > 64 {
+        return Err("recipient_expectations supports at most 64 recipients".to_owned());
+    }
+    if let Some(fingerprint) = expectations.group_fingerprint.as_ref()
+        && (fingerprint.is_empty() || fingerprint.len() > 16_384)
+    {
+        return Err("group_fingerprint is empty or too long".to_owned());
+    }
+    for recipient in &expectations.recipients {
+        if recipient.address_id.as_str().is_empty()
+            || recipient
+                .pane_binding_id
+                .as_ref()
+                .is_some_and(|id| id.as_str().is_empty())
+            || recipient
+                .agent_session_id
+                .as_ref()
+                .is_some_and(|id| id.as_str().is_empty())
+        {
+            return Err("recipient expectation IDs must not be empty".to_owned());
+        }
+    }
+    expectations
+        .recipients
+        .sort_by(|left, right| left.address_id.cmp(&right.address_id));
+    if expectations
+        .recipients
+        .windows(2)
+        .any(|pair| pair[0].address_id == pair[1].address_id)
+    {
+        return Err("recipient_expectations contains a duplicate address_id".to_owned());
+    }
+    Ok(expectations)
+}
+
+pub(crate) fn validate_resolved_recipient_expectations(
+    expectations: &crate::RecipientExpectations,
+    recipients: &[crate::RoutingAddressSnapshot],
+    addresses: &[crate::PaneAddressRecord],
+    discovered: &crate::DiscoveredWorktree,
+) -> Result<(), String> {
+    let address_ids = recipients
+        .iter()
+        .map(|recipient| recipient.address_id.clone())
+        .collect::<Vec<_>>();
+    if expectations
+        .group_fingerprint
+        .as_ref()
+        .is_some_and(|expected| *expected != crate::group_membership_fingerprint(&address_ids))
+    {
+        return Err(
+            "group_changed: expanded group membership changed since directory lookup".to_owned(),
+        );
+    }
+    if expectations.recipients.is_empty() {
+        return Ok(());
+    }
+    let mut actual = recipients.to_vec();
+    actual.sort_by(|left, right| left.address_id.cmp(&right.address_id));
+    let changed = actual.len() != expectations.recipients.len()
+        || actual
+            .iter()
+            .zip(&expectations.recipients)
+            .any(|(actual, expected)| {
+                let live_session = addresses
+                    .iter()
+                    .find(|address| address.id == actual.address_id)
+                    .and_then(|address| address.pane_id.as_deref())
+                    .and_then(|pane_id| {
+                        discovered.panes.iter().find(|pane| pane.pane_id == pane_id)
+                    })
+                    .and_then(|pane| pane.agent_session_id.as_ref());
+                actual.address_id != expected.address_id
+                    || expected
+                        .pane_binding_id
+                        .as_ref()
+                        .is_some_and(|id| actual.pane_binding_id.as_ref() != Some(id))
+                    || expected.agent_session_id.as_ref().is_some_and(|id| {
+                        actual.agent_session_id.as_ref() != Some(id) || live_session != Some(id)
+                    })
+            });
+    if changed {
+        return Err(
+            "recipient_changed: recipient identity, binding, or session changed since directory lookup"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_recipient_capacity(
+    expectations: &crate::RecipientExpectations,
+    recipients: &[crate::RoutingAddressSnapshot],
+    transaction: &crate::StateTransaction<'_>,
+    namespace: &StateNamespace,
+    discovered: &crate::DiscoveredWorktree,
+    shell_availability: &std::collections::BTreeMap<String, bool>,
+) -> Result<(), crate::StoreError> {
+    if !expectations.require_automatic_selection_suitable {
+        return Ok(());
+    }
+    for recipient in recipients {
+        let readiness = transaction.recipient_readiness(
+            namespace,
+            discovered,
+            &recipient.address_id,
+            None,
+            shell_availability,
+        )?;
+        if !readiness.automatic_selection_suitable {
+            return Err(crate::StoreError::invalid_input(format!(
+                "recipient_unavailable: @{} is not currently suitable for automatic selection",
+                recipient.alias
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn resolve_aliases(

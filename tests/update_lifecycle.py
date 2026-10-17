@@ -16,6 +16,7 @@ import time
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / 'scripts'))
 from runtime import LAUNCHER
+from update import is_codex
 SCHEMA_VERSION = int(re.search(r'const SCHEMA_VERSION: u32 = (\d+);', (REPO/'src/store.rs').read_text())[1])
 assert int(re.search(r'^SCHEMA_VERSION = (\d+)$', (REPO/'scripts/update.py').read_text(), re.M)[1]) == SCHEMA_VERSION, 'Updater preflight must be reviewed when the store schema changes'
 HOST = r'''#!/usr/bin/env python3
@@ -293,11 +294,11 @@ def case(mode, answer=b'yes\n', ref='main', subdir=None, interactive=True, choic
         if mode == 'missing-ref': del source['requested_ref']
         (base/'registry').write_text(json.dumps({'result': {'type':'plugin_list', 'plugins':[
             {'plugin_id':'namedrop', 'plugin_root':str(old), 'source':source}]}}))
-        env = {k:v for k,v in os.environ.items() if not k.startswith(('HERDR_', 'CODEX_'))}
+        env = {k:v for k,v in os.environ.items() if not k.startswith(('HERDR_', 'CODEX_', 'KIMI_'))}
         env['PYTHONPATH'] = str(base)
         env.update(PATH=str(base/'bin')+os.pathsep+os.environ['PATH'], FIXTURE=str(base), CASE=mode,
                    TEST_REPO=str(REPO), LIVE='1' if live else '0', INCOMPATIBLE='1' if incompatible else '',
-                   HOME=str(base/'home'), CLAUDE_CONFIG_DIR=str(base/'home/.claude'), CODEX_HOME=str(base/'home/.codex'), HERDR_SOCKET_PATH='socket', HERDR_WORKSPACE_ID='w',
+                   HOME=str(base/'home'), CLAUDE_CONFIG_DIR=str(base/'home/.claude'), CODEX_HOME=str(base/'home/.codex'), KIMI_CODE_HOME=str(base/'home/.kimi-code'), HERDR_SOCKET_PATH='socket', HERDR_WORKSPACE_ID='w',
                    HERDR_PANE_ID='w:p', HERDR_PLUGIN_STATE_DIR=str(state))
         command = ['sh', str(old/'scripts/update.sh')]
         if mode == 'open': command.append('--open')
@@ -532,4 +533,9 @@ if __name__ == '__main__':
     case('busy', live=True, prior_schema=2)
     case('busy', live=True, prior_schema=SCHEMA_VERSION + 1)
     case('unchanged', live=True, prior_schema=3)
+    assert is_codex({'agent': 'codex'})
+    assert not is_codex({'agent': 'claude'})
+    assert not is_codex({'agent': 'kimi'})
+    assert not is_codex({'agent': 'kimi-code'})
+    assert is_codex({'agent': 'future-runtime'}), 'Unknown runtimes must stay on the conservative migration path'
     print('update lifecycle checks passed')

@@ -815,3 +815,117 @@ fn request_fingerprint_matches_the_main_serialization_and_replays() {
         true
     );
 }
+
+#[test]
+fn recipient_expectations_guard_new_sends_and_early_replays() {
+    let directory = TestDirectory::new();
+    setup_addresses(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let runtime = LifecycleRuntime {
+        state_directory: directory.path(),
+        home_directory: Some(directory.home()),
+        agent_config: namedrop::AgentConfigDirectories::default(),
+        cwd: Path::new("/repo"),
+        workspace_id: None,
+        current_pane_id: Some("pane-author"),
+        session_socket_id: "socket-a",
+        herdr: &FakeHerdr,
+        clock: &FixedClock,
+        ids: &ids,
+    };
+    let input = serde_json::json!({
+        "request_id": "guarded-request",
+        "source": "@reviewer Please inspect this.",
+        "recipient_expectations": {
+            "recipients": [{"address_id": "address-reviewer"}]
+        }
+    });
+    let first = execute_message_operation("send", input.clone(), &runtime).unwrap();
+    let namespace = StateNamespace::for_space("socket-a", "workspace-1");
+    StateStore::open(directory.path())
+        .unwrap()
+        .transaction(|transaction| {
+            transaction.replace_alias(
+                &namespace,
+                &PaneAddressId::new("address-reviewer"),
+                "code-reviewer",
+                &MutationAttribution::new(ActorKind::Human, "test", 43),
+            )
+        })
+        .unwrap();
+
+    let replay = execute_message_operation("send", input.clone(), &runtime).unwrap();
+    assert_eq!(replay["message_id"], first["message_id"]);
+    assert_eq!(replay["idempotent_replay"], true);
+
+    let mut changed_replay = input;
+    changed_replay["recipient_expectations"]["recipients"][0]["address_id"] =
+        serde_json::json!("address-planner");
+    assert!(
+        execute_message_operation("send", changed_replay, &runtime)
+            .unwrap_err()
+            .contains("different recipient expectations")
+    );
+
+    let stale = serde_json::json!({
+        "request_id": "stale-request",
+        "source": "@planner Please inspect this.",
+        "recipient_expectations": {
+            "recipients": [{"address_id": "address-reviewer"}]
+        }
+    });
+    assert!(
+        execute_message_operation("send", stale, &runtime)
+            .unwrap_err()
+            .starts_with("recipient_changed:")
+    );
+}
+
+#[test]
+fn group_fingerprint_guards_expanded_recipients_and_replays() {
+    let directory = TestDirectory::new();
+    setup_addresses(&directory);
+    let ids = SequenceIds(AtomicU64::new(1));
+    let runtime = LifecycleRuntime {
+        state_directory: directory.path(),
+        home_directory: Some(directory.home()),
+        agent_config: namedrop::AgentConfigDirectories::default(),
+        cwd: Path::new("/repo"),
+        workspace_id: None,
+        current_pane_id: Some("pane-author"),
+        session_socket_id: "socket-a",
+        herdr: &FakeHerdr,
+        clock: &FixedClock,
+        ids: &ids,
+    };
+    let fingerprint = namedrop::group_membership_fingerprint(&[
+        PaneAddressId::new("address-reviewer"),
+        PaneAddressId::new("address-planner"),
+    ]);
+    let input = serde_json::json!({
+        "request_id": "group-guarded-request",
+        "source": "@reviewer @planner Please inspect this.",
+        "recipient_expectations": {
+            "recipients": [],
+            "group_fingerprint": fingerprint
+        }
+    });
+    execute_message_operation("send", input.clone(), &runtime).unwrap();
+
+    let mut changed = input;
+    changed["recipient_expectations"]["group_fingerprint"] =
+        serde_json::json!(namedrop::group_membership_fingerprint(&[
+            PaneAddressId::new("address-reviewer")
+        ]));
+    assert!(
+        execute_message_operation("send", changed.clone(), &runtime)
+            .unwrap_err()
+            .contains("different recipient expectations")
+    );
+    changed["request_id"] = serde_json::json!("group-stale-request");
+    assert!(
+        execute_message_operation("send", changed, &runtime)
+            .unwrap_err()
+            .starts_with("group_changed:")
+    );
+}

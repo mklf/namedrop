@@ -83,7 +83,7 @@ pub fn render_command_result_to_text(result: &CommandResult) -> String {
             }
             lines.push("\nNext steps — for the runtimes you use".into());
             hook_steps(&data["agent_integration_hook_activation"], &mut lines);
-            lines.push("  Check native hooks: herdr integration status\n  If setup is needed, choose your runtime:\n    herdr integration install codex\n    herdr integration install claude".into());
+            lines.push("  Check native hooks: herdr integration status\n  If setup is needed, choose your runtime:\n    herdr integration install codex\n    herdr integration install claude\n    herdr integration install kimi".into());
             lines.push("  Start fresh agent sessions and confirm a request and reply to verify their hooks.".into());
             field("Shell", &data["shell_command"]["next_step"], 1, &mut lines);
             field(
@@ -149,6 +149,93 @@ pub fn render_command_result_to_text(result: &CommandResult) -> String {
                     }
                 }
             }
+        }
+        "address.resolve" => {
+            for result in data["results"].as_array().into_iter().flatten() {
+                let query = result["query"].as_str().unwrap_or("self");
+                match result["status"].as_str().unwrap_or("unknown") {
+                    "found" if result["type"] == "group" => {
+                        let members = result["members"]
+                            .as_array()
+                            .map(|members| {
+                                members
+                                    .iter()
+                                    .map(|member| {
+                                        if member["alias"].is_string() {
+                                            alias(&member["alias"])
+                                        } else {
+                                            format!("unavailable ({})", text(&member["address_id"]))
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        lines.push(format!("{}: group with {members}", alias(&result["alias"])));
+                    }
+                    "found" => {
+                        lines.push(format!(
+                            "{}: found {} — {}",
+                            alias(&result["alias"]),
+                            text(&result["pane_type"]),
+                            text(&result["selection"])
+                        ));
+                        field("Readiness", &result["readiness"], 1, &mut lines);
+                        if let Some(persona) = result["persona"].as_str() {
+                            field(
+                                "Persona (untrusted)",
+                                &Value::String(persona.to_owned()),
+                                1,
+                                &mut lines,
+                            );
+                        }
+                    }
+                    "retired" => {
+                        lines.push(format!(
+                            "{}: retired",
+                            alias(&Value::String(query.to_owned()))
+                        ));
+                        if let Some(replacement) = result["replacement"]["alias"].as_str() {
+                            lines.push(format!(
+                                "  Replacement (not followed): {}",
+                                alias(&Value::String(replacement.to_owned()))
+                            ));
+                        }
+                    }
+                    _ => lines.push(format!(
+                        "{}: unknown",
+                        alias(&Value::String(query.to_owned()))
+                    )),
+                }
+            }
+        }
+        "address.candidates" => {
+            let candidates = data["candidates"].as_array();
+            if candidates.is_some_and(Vec::is_empty) {
+                lines.push("No matching candidates.".into());
+            }
+            for candidate in candidates.into_iter().flatten() {
+                let persona = if candidate["pane_type"] == "terminal" {
+                    String::new()
+                } else {
+                    format!(
+                        " — {}",
+                        crate::persona::displayed(
+                            candidate["persona"].as_str(),
+                            crate::directory::DIRECTORY_PERSONA_EXCERPT_CHARS,
+                        )
+                    )
+                };
+                lines.push(format!(
+                    "{} ({}): {}{persona}",
+                    alias(&candidate["alias"]),
+                    text(&candidate["pane_type"]),
+                    text(&candidate["selection"]),
+                ));
+            }
+            field("Total", &data["total"], 0, &mut lines);
+            field("Has more", &data["has_more"], 0, &mut lines);
+            field("Next cursor", &data["next_cursor"], 0, &mut lines);
         }
         "group.list" => {
             if let Some(groups) = data["groups"].as_array() {

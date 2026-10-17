@@ -9,7 +9,7 @@ use namedrop::{
     describe_operations, diagnose_collaboration, execute_context_operation,
     execute_control_operation, execute_group_operation, execute_handoff_operation,
     execute_integration_operation, execute_lifecycle_operation, execute_message_operation,
-    execute_user_prompt_submit_hook, is_context_operation, is_control_operation,
+    execute_user_prompt_submit_hook_with_mode, is_context_operation, is_control_operation,
     is_integration_operation, is_lifecycle_operation, is_message_operation,
     render_command_result_to_text, validate_message_input,
 };
@@ -160,7 +160,11 @@ fn main() -> ExitCode {
     };
 
     if let Some(state_directory) = cli.user_prompt_submit_hook_state_directory() {
-        return run_user_prompt_submit_hook(state_directory);
+        return run_user_prompt_submit_hook(
+            state_directory,
+            cli.user_prompt_submit_hook_format(),
+            cli.user_prompt_submit_hook_context_mode(),
+        );
     }
     if let Some(state_directory) = cli.mailbox_wake_hook_state_directory() {
         return run_mailbox_wake_hook(state_directory);
@@ -437,11 +441,18 @@ fn finish(
             );
             write_result(&CommandResult::success(operation, data), code, human)
         }
-        Err(error) => write_result(
-            &CommandResult::rejected(operation, "operation_failed", error),
-            65,
-            human,
-        ),
+        Err(error) => {
+            let code = if error.starts_with("recipient_changed:") {
+                "recipient_changed"
+            } else if error.starts_with("group_changed:") {
+                "group_changed"
+            } else if error.starts_with("recipient_unavailable:") {
+                "recipient_unavailable"
+            } else {
+                "operation_failed"
+            };
+            write_result(&CommandResult::rejected(operation, code, error), 65, human)
+        }
     }
 }
 
@@ -595,6 +606,7 @@ fn with_runtime_options<T>(
         .filter(|path| path.is_absolute());
     let claude_config = env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
     let codex_config = env::var_os("CODEX_HOME").map(PathBuf::from);
+    let kimi_config = env::var_os("KIMI_CODE_HOME").map(PathBuf::from);
     let cwd = env::current_dir().map_err(|error| error.to_string())?;
     let herdr = ProcessHerdr::default().with_socket(options.herdr_socket.clone());
     let mut workspace_id = options
@@ -609,11 +621,15 @@ fn with_runtime_options<T>(
         Some(pane) => Some(pane),
         None => match env::var("HERDR_PANE_ID") {
             Ok(pane) => {
-                let sessions: Vec<String> = ["CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID"]
-                    .into_iter()
-                    .filter_map(|key| env::var(key).ok())
-                    .filter(|session| !session.is_empty())
-                    .collect();
+                let sessions: Vec<String> = [
+                    "CODEX_SESSION_ID",
+                    "CLAUDE_CODE_SESSION_ID",
+                    "NAMEDROP_AGENT_SESSION_ID",
+                ]
+                .into_iter()
+                .filter_map(|key| env::var(key).ok())
+                .filter(|session| !session.is_empty())
+                .collect();
                 let sessions: Vec<&str> = sessions.iter().map(String::as_str).collect();
                 namedrop::verify_inherited_pane(&herdr, &pane, &sessions)?;
                 Some(pane)
@@ -630,10 +646,14 @@ fn with_runtime_options<T>(
     // Codex app-server keeps the environment it started with). The agent's
     // own session ID still arrives, and Herdr knows which pane runs it.
     if workspace_id.is_none()
-        && let Some((space, pane)) = ["CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID"]
-            .into_iter()
-            .find_map(|key| env::var(key).ok().filter(|session| !session.is_empty()))
-            .and_then(|session| namedrop::locate_agent_session_pane(&herdr, &session))
+        && let Some((space, pane)) = [
+            "CODEX_SESSION_ID",
+            "CLAUDE_CODE_SESSION_ID",
+            "NAMEDROP_AGENT_SESSION_ID",
+        ]
+        .into_iter()
+        .find_map(|key| env::var(key).ok().filter(|session| !session.is_empty()))
+        .and_then(|session| namedrop::locate_agent_session_pane(&herdr, &session))
     {
         workspace_id = Some(space);
         pane_id = pane_id.or(Some(pane));
@@ -662,6 +682,7 @@ fn with_runtime_options<T>(
         agent_config: namedrop::AgentConfigDirectories {
             claude: claude_config.as_deref(),
             codex: codex_config.as_deref(),
+            kimi: kimi_config.as_deref(),
         },
         cwd: &cwd,
         workspace_id: workspace_id.as_deref(),
@@ -673,16 +694,68 @@ fn with_runtime_options<T>(
     })
 }
 
-fn run_user_prompt_submit_hook(state_directory: &Path) -> ExitCode {
+fn run_user_prompt_submit_hook(
+    state_directory: &Path,
+    format: namedrop::HookOutputFormat,
+    context_mode: namedrop::HookContextMode,
+) -> ExitCode {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
         return ExitCode::SUCCESS;
     }
+    if context_mode == namedrop::HookContextMode::OnDemandV1
+        && !namedrop::user_prompt_submit_requires_runtime(&input)
+    {
+        return ExitCode::SUCCESS;
+    }
+    if let Some(session_id) = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|session| !session.is_empty())
+    {
+        // SAFETY: no worker threads have been started yet, so changing this
+        // process's environment cannot race another thread.
+        unsafe { env::set_var("NAMEDROP_AGENT_SESSION_ID", session_id) };
+    }
     let output = with_runtime_at(state_directory, |runtime| {
-        Ok(execute_user_prompt_submit_hook(&input, runtime))
+        let output = execute_user_prompt_submit_hook_with_mode(&input, runtime, context_mode);
+        if format == namedrop::HookOutputFormat::Kimi
+            && output.as_ref().is_some_and(|output| {
+                output.get("decision").and_then(serde_json::Value::as_str) == Some("block")
+                    && output.get("reason").and_then(serde_json::Value::as_str)
+                        == Some("Collaboration message sent.")
+            })
+            && let (Some(pane), Ok(session)) = (
+                runtime.current_pane_id,
+                env::var("NAMEDROP_AGENT_SESSION_ID"),
+            )
+        {
+            // Kimi does not emit Stop for a denied prompt, so its native working
+            // state must be settled after the confirmed handoff.
+            let _ = runtime.herdr.execute(&[
+                "pane",
+                "report-agent",
+                pane,
+                "--source",
+                "herdr:kimi",
+                "--agent",
+                "kimi",
+                "--state",
+                "idle",
+                "--agent-session-id",
+                &session,
+            ]);
+        }
+        Ok(output)
     })
     .ok()
-    .flatten();
+    .flatten()
+    .and_then(|output| namedrop::format_user_prompt_submit_hook_output(output, format));
     if let Some(output) = output {
         let _ = serde_json::to_writer(io::stdout().lock(), &output);
     }
@@ -690,6 +763,10 @@ fn run_user_prompt_submit_hook(state_directory: &Path) -> ExitCode {
 }
 
 fn run_mailbox_wake_hook(state_directory: &Path) -> ExitCode {
+    // This space-scoped hook can be reparented when its wrapper exits.
+    // SAFETY: no worker threads have been started yet, so changing this
+    // process's environment cannot race another thread.
+    unsafe { env::remove_var("HERDR_PANE_ID") };
     let _ = with_runtime_at(state_directory, |runtime| {
         let space_id = match runtime.workspace_id {
             Some(space_id) => space_id.to_owned(),
