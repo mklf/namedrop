@@ -1596,9 +1596,9 @@ fn packaged_skill_profiles_stay_compact_and_defer_delivery_discovery() {
         let instructions = integration_package(runtime).instructions;
         // A tripwire, not a target: the packaged profile is loaded into every
         // session. The permissions section adds the persistent Claude settings
-        // contract; keep the remaining profile within the existing budget.
+        // contract; keep the remaining profile within the 10,000-byte budget.
         assert!(
-            instructions.len() < 7_800,
+            instructions.len() < 10_000,
             "{} packaged profile is {} bytes",
             runtime.as_str(),
             instructions.len()

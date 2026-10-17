@@ -33,6 +33,10 @@ Multi-step delegation: `handoff.begin` takes `request_id` and human `deliverable
 
 On explicit request, use `namedrop name @alias` and other management mutations directly. `namedrop address list` is the full compatibility read.
 
+## Create named agents
+
+On explicit request, coordinate Herdr agent creation with Namedrop naming and set the requested persona while naming. Every new agent's first prompt must explicitly tell the model its identity: its exact `@alias` and its role or persona, or that it is a generic agent when no specialty was requested. Combine the identity statement with the initial task, or use a short initialization prompt when no task was given. Keep the alias embedded in a sentence; a column-zero Mention routes the prompt instead of giving it to the new agent. Verify the saved persona and registration before reporting creation complete.
+
 ## When the person in your pane uses a Mention
 
 A Mention at column zero sends the full prompt unchanged only to leading recipients as a human-authored relay; the hook blocks locally without roster context. A miss or unconfirmed handoff stays local and uses Herdr UI, never injected guidance; never retry automatically. If the person still wants a handoff, `send` the unchanged leading source as `author_kind` `agent_session`.
